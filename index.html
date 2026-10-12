@@ -1,0 +1,1190 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Walk Around + Creature Toolkit</title>
+<style>
+  :root { --panel: rgba(255,255,255,0.88); --text: #16303f; --btn: rgba(22,48,63,0.10); }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) { --panel: rgba(20,33,43,0.88); --text: #e6f1f7; --btn: rgba(230,241,247,0.14); }
+  }
+  :root[data-theme="dark"] { --panel: rgba(20,33,43,0.88); --text: #e6f1f7; --btn: rgba(230,241,247,0.14); }
+
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #9fd0ee; font: 14px/1.3 system-ui, sans-serif; }
+  canvas { display: block; touch-action: none; cursor: grab; }
+
+  #panel {
+    position: fixed; top: calc(10px + env(safe-area-inset-top, 0px)); left: 10px;
+    width: 230px; max-height: 80%; overflow-y: auto; box-sizing: border-box;
+    background: var(--panel); color: var(--text); border-radius: 10px; padding: 10px 12px;
+  }
+  #panel summary { cursor: pointer; font-weight: 600; }
+  #panel button {
+    font: inherit; color: var(--text); background: var(--btn);
+    border: 0; border-radius: 6px; padding: 6px 8px; cursor: pointer;
+  }
+  #viewBtn, #ctrlBtn { width: 100%; margin-top: 8px; }
+  #presets { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; margin-top: 6px; }
+  #panel h4 { margin: 14px 0 0; font-size: 13px; }
+  #panel label.row { display: block; margin-top: 10px; }
+  #panel label.row span { display: flex; justify-content: space-between; }
+  #panel input[type=range] { width: 100%; margin: 4px 0 0; }
+  #panel label.check { display: flex; gap: 8px; align-items: center; margin-top: 12px; }
+
+  #hint {
+    position: fixed; left: 0; right: 0; bottom: 0;
+    padding: 12px 12px calc(12px + env(safe-area-inset-bottom, 0px));
+    text-align: center; color: #0b3550; pointer-events: none;
+  }
+</style>
+</head>
+<body>
+
+<details id="panel" open>
+  <summary>Controls</summary>
+  <button id="viewBtn"></button>
+  <button id="ctrlBtn"></button>
+  <h4>Terrain</h4>
+  <div id="terrainBox"></div>
+  <h4>Creature presets</h4>
+  <div id="presets"></div>
+  <h4>Build your own</h4>
+  <div id="sliders"></div>
+  <label class="check"><input type="checkbox" id="wander" checked> Creature wanders</label>
+</details>
+<div id="hint">V changes the view. C switches between controlling you and the creature. W A S D to move, Space to jump (you). Drag to look or orbit, scroll to zoom.</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script>
+// =====================================================================
+// PART A: THE WORLD (scene, light, floor, boxes). Same as before, plus shadows.
+// =====================================================================
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x9fd0ee);
+scene.fog = new THREE.Fog(0x9fd0ee, 15, 45);
+
+const camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.1, 100);
+camera.rotation.order = 'YXZ';
+
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+renderer.shadowMap.enabled = true;       // shadows show where feet touch the ground
+document.body.appendChild(renderer.domElement);
+
+scene.add(new THREE.AmbientLight(0xffffff, 0.65));
+const sun = new THREE.DirectionalLight(0xffffff, 0.7);
+sun.position.set(10, 20, 5);
+sun.castShadow = true;
+sun.shadow.mapSize.set(2048, 2048);
+sun.shadow.camera.left = -35; sun.shadow.camera.right = 35;
+sun.shadow.camera.top = 35;   sun.shadow.camera.bottom = -35;
+sun.shadow.camera.near = 1;   sun.shadow.camera.far = 70;
+sun.shadow.bias = -0.0008;
+scene.add(sun);
+
+// The floor is now a bumpy mesh. We make a flat grid of points here and
+// lift each point to the terrain height further down (rebuildTerrain).
+const terrainGeo = new THREE.PlaneGeometry(50, 50, 125, 125);
+terrainGeo.rotateX(-Math.PI / 2);                  // lay it flat so x and z are floor coordinates
+terrainGeo.setAttribute('color', new THREE.BufferAttribute(new Float32Array(terrainGeo.attributes.position.count * 3), 3));
+const floor = new THREE.Mesh(terrainGeo, new THREE.MeshPhongMaterial({ vertexColors: true, flatShading: true, shininess: 0, specular: 0x000000 }));
+floor.receiveShadow = true;
+scene.add(floor);
+
+const boxes = [];                        // remember every box so we can collide with it
+function addBox(x, z, size, height, color) {
+  boxes.push({ x, z, half: size / 2, height });
+  const box = new THREE.Mesh(
+    new THREE.BoxGeometry(size, height, size),
+    new THREE.MeshLambertMaterial({ color })
+  );
+  box.position.set(x, height / 2, z);
+  box.castShadow = true;
+  box.receiveShadow = true;
+  scene.add(box);
+}
+addBox(0, 0, 2, 2, 0xd23b3b);
+addBox(-8, -6, 3, 5, 0x3b82d2);
+addBox(7, -9, 2, 1, 0xe6b422);
+addBox(4, -4, 2, 0.8, 0xe67e22);         // two steps you can jump up
+addBox(6, -4, 2, 1.6, 0xe67e22);
+addBox(10, 4, 4, 3, 0x8e5bd2);
+addBox(-10, 8, 2, 2, 0xf2f2f2);
+
+// ---- Terrain ----------------------------------------------------------
+// terrainHeight(x, z) answers "how high is the ground here?".
+// The player and every creature foot ask the world this question, so changing
+// this one function changes the ground for everything.
+let roughness = 1.0;                     // 0 = flat floor, bigger = taller, sharper terrain
+const smooth01 = t => t * t * (3 - 2 * t);
+
+// "Value noise": a random height at every whole-number grid point, blended
+// smoothly in between. Using a hash instead of Math.random keeps it the same every time.
+function hash2(ix, iz) {
+  let h = Math.imul(ix, 374761393) ^ Math.imul(iz, 668265263);
+  h = Math.imul(h ^ (h >>> 13), 1274126177);
+  return ((h ^ (h >>> 16)) >>> 0) / 4294967296;
+}
+function valueNoise(x, z) {
+  const ix = Math.floor(x), iz = Math.floor(z);
+  const fx = smooth01(x - ix), fz = smooth01(z - iz);
+  const a = hash2(ix, iz), b = hash2(ix + 1, iz), c = hash2(ix, iz + 1), d = hash2(ix + 1, iz + 1);
+  const top = a + (b - a) * fx, bottom = c + (d - c) * fx;
+  return top + (bottom - top) * fz;
+}
+
+function terrainHeight(x, z) {
+  // Three layers added together: big hills, sharp ridges, small bumps
+  const big   = (valueNoise(x * 0.15, z * 0.15) - 0.5) * 2.4;
+  const ridge = ((1 - Math.abs(2 * valueNoise(x * 0.3 + 40, z * 0.3 + 17) - 1)) - 0.5) * 1.0;   // folding the noise makes sharp creases
+  const small = (valueNoise(x * 0.9 + 9, z * 0.9 + 71) - 0.5) * 0.3;
+  const h = (big + ridge + small) * roughness;
+
+  // Flatten the ground near the boxes and your starting spot
+  let flat = 1;
+  for (const b of boxes) {
+    const d = Math.max(Math.abs(x - b.x), Math.abs(z - b.z)) - b.half;
+    flat *= smooth01(Math.max(0, Math.min(1, (d - 0.5) / 3)));
+  }
+  flat *= smooth01(Math.max(0, Math.min(1, (Math.hypot(x, z - 8) - 2) / 4)));
+  return h * flat;
+}
+
+// What creatures stand on: the terrain, or the top of a box if there is one here.
+// (You, the player, treat boxes separately: you jump up onto them.)
+const world = {
+  // maxBox: ignore boxes taller than this (a creature that can't climb a box treats it as a wall, not ground)
+  groundHeight(x, z, maxBox = Infinity) {
+    let g = terrainHeight(x, z);
+    for (const b of boxes) {
+      if (b.height > maxBox) continue;
+      if (Math.abs(x - b.x) <= b.half && Math.abs(z - b.z) <= b.half && b.height > g) g = b.height;
+    }
+    return g;
+  }
+};
+
+// Move every point of the floor mesh to its terrain height, and color it by height
+function rebuildTerrain() {
+  const pos = terrainGeo.attributes.position, col = terrainGeo.attributes.color;
+  for (let i = 0; i < pos.count; i++) {
+    const y = terrainHeight(pos.getX(i), pos.getZ(i));
+    pos.setY(i, y);
+    const t = Math.max(0, Math.min(1, (y + 1.5) / 3));
+    col.setXYZ(i, 0.28 + 0.45 * t, 0.46 + 0.34 * t, 0.30 + 0.22 * t);
+  }
+  pos.needsUpdate = true;
+  col.needsUpdate = true;
+  terrainGeo.computeVertexNormals();
+  terrainGeo.computeBoundingSphere();
+}
+rebuildTerrain();
+
+// =====================================================================
+// PART B: THE PLAYER (walking, collision, jumping) and the CAMERA VIEWS
+// =====================================================================
+const player = { x: 0, z: 8 };           // where you stand on the floor
+let yaw = 0, pitch = 0;                  // which way you look
+const EYE = 1.7;
+const RADIUS = 0.4;
+const GRAVITY = 20;
+const JUMP_SPEED = 7;
+let feetY = 0, velY = 0, onGround = true;
+
+function overlaps(b, px, pz) {
+  return Math.abs(px - b.x) < b.half + RADIUS && Math.abs(pz - b.z) < b.half + RADIUS;
+}
+function blocked(px, pz) {
+  return boxes.some(b => overlaps(b, px, pz) && feetY < b.height - 0.05);
+}
+function groundAt(px, pz, fromY) {
+  let g = terrainHeight(px, pz);          // bare terrain always holds you up; boxes are checked below
+  for (const b of boxes) {
+    if (overlaps(b, px, pz) && b.height <= fromY + 0.05) g = Math.max(g, b.height);
+  }
+  return g;
+}
+
+// A simple stand-in body so you can see yourself in third person
+const avatar = new THREE.Group();
+(function buildAvatar() {
+  const mat = new THREE.MeshLambertMaterial({ color: 0x3b82d2 });
+  const trunk = new THREE.Mesh(new THREE.CylinderGeometry(0.28, 0.28, 1.1, 16), mat);
+  trunk.position.y = 0.65;
+  const head = new THREE.Mesh(new THREE.SphereGeometry(0.25, 16, 12), new THREE.MeshLambertMaterial({ color: 0xf2d2b0 }));
+  head.position.y = 1.4;
+  const nose = new THREE.Mesh(new THREE.BoxGeometry(0.12, 0.12, 0.2), new THREE.MeshLambertMaterial({ color: 0xd23b3b }));
+  nose.position.set(0, 1.4, -0.28);      // sticks out the front so you can tell which way you face
+  for (const m of [trunk, head, nose]) { m.castShadow = true; avatar.add(m); }
+})();
+scene.add(avatar);
+
+// --- Camera views: first person, third person (behind you), observe the creature
+const CAM_ORDER = ['first', 'third', 'observe'];
+const CAM_NAMES = { first: 'First person', third: 'Third person', observe: 'Observe creature' };
+let camMode = 'observe';
+let thirdDist = 5;                       // how far behind you in third person
+let orbitYaw = 0.6, orbitPitch = 0.45, orbitDist = 9;   // observe view settings
+const obsTarget = new THREE.Vector3(-4, 1, 12);         // what the observe camera looks at
+const viewBtn = document.getElementById('viewBtn');
+
+function setCamMode(mode) {
+  camMode = mode;
+  viewBtn.textContent = 'View: ' + CAM_NAMES[mode] + ' (V)';
+  avatar.visible = mode !== 'first';     // hide your own body in first person
+}
+viewBtn.addEventListener('click', () => {
+  setCamMode(CAM_ORDER[(CAM_ORDER.indexOf(camMode) + 1) % CAM_ORDER.length]);
+  viewBtn.blur();
+});
+
+// --- Who do the keys control: you, or the creature?
+let controlCreature = false;
+const ctrlBtn = document.getElementById('ctrlBtn');
+function setControl(on) {
+  controlCreature = on;
+  ctrlBtn.textContent = 'Controlling: ' + (on ? 'Creature' : 'You') + ' (C)';
+  if (on) { document.getElementById('wander').checked = false; setCamMode('observe'); }         // so you can watch what you're driving
+}
+ctrlBtn.addEventListener('click', () => { setControl(!controlCreature); ctrlBtn.blur(); });
+
+// --- Input
+const keys = {};
+window.addEventListener('keydown', e => {
+  keys[e.code] = true;
+  if (e.code === 'Space' || e.code.startsWith('Arrow')) e.preventDefault();
+  if (e.code === 'KeyV' && !e.repeat) viewBtn.click();
+  if (e.code === 'KeyC' && !e.repeat) ctrlBtn.click();
+});
+window.addEventListener('keyup', e => { keys[e.code] = false; });
+
+let dragging = false, lastX = 0, lastY = 0;
+renderer.domElement.addEventListener('pointerdown', e => { dragging = true; lastX = e.clientX; lastY = e.clientY; });
+window.addEventListener('pointerup', () => { dragging = false; });
+window.addEventListener('pointermove', e => {
+  if (!dragging) return;
+  const dx = e.clientX - lastX, dy = e.clientY - lastY;
+  if (camMode === 'observe') {           // dragging orbits around the creature
+    orbitYaw -= dx * 0.006;
+    orbitPitch = Math.max(0.05, Math.min(1.4, orbitPitch + dy * 0.006));
+  } else {                               // dragging turns where you look
+    yaw -= dx * 0.004;
+    pitch = Math.max(-1.3, Math.min(1.3, pitch - dy * 0.004));
+  }
+  lastX = e.clientX; lastY = e.clientY;
+});
+window.addEventListener('wheel', e => {
+  if (camMode === 'third') thirdDist = Math.max(2, Math.min(12, thirdDist + e.deltaY * 0.01));
+  if (camMode === 'observe') orbitDist = Math.max(4, Math.min(30, orbitDist + e.deltaY * 0.015));
+});
+window.addEventListener('resize', () => {
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+});
+
+// Which way is "forward" on screen? In observe view it is away from the camera.
+function viewHeading() { return (camMode === 'observe') ? orbitYaw : yaw; }
+
+// Read W A S D / arrow keys as a direction on the floor, relative to the view.
+// Both you and the creature use this.
+const moveInput = { x: 0, z: 0 };
+function readMoveInput(heading) {
+  const forwardX = -Math.sin(heading), forwardZ = -Math.cos(heading);
+  const rightX = Math.cos(heading), rightZ = -Math.sin(heading);
+  let x = 0, z = 0;
+  if (keys['KeyW'] || keys['ArrowUp'])    { x += forwardX; z += forwardZ; }
+  if (keys['KeyS'] || keys['ArrowDown'])  { x -= forwardX; z -= forwardZ; }
+  if (keys['KeyD'] || keys['ArrowRight']) { x += rightX;   z += rightZ; }
+  if (keys['KeyA'] || keys['ArrowLeft'])  { x -= rightX;   z -= rightZ; }
+  moveInput.x = x; moveInput.z = z;
+  return moveInput;
+}
+
+const SPEED = 5;
+const LIMIT = 24;
+
+function updatePlayer(dt) {
+  const heading = viewHeading();
+  let moveX = 0, moveZ = 0;
+  if (!controlCreature) {                // while you control the creature, you stand still
+    const m = readMoveInput(heading);
+    moveX = m.x; moveZ = m.z;
+  }
+
+  // Move one direction at a time, so you slide along walls instead of sticking
+  const newX = Math.max(-LIMIT, Math.min(LIMIT, player.x + moveX * SPEED * dt));
+  if (!blocked(newX, player.z)) player.x = newX;
+  const newZ = Math.max(-LIMIT, Math.min(LIMIT, player.z + moveZ * SPEED * dt));
+  if (!blocked(player.x, newZ)) player.z = newZ;
+
+  // Jumping and gravity
+  if (keys['Space'] && onGround && !controlCreature) velY = JUMP_SPEED;
+  const prevFeet = feetY;
+  const wasOnGround = onGround;
+  velY -= GRAVITY * dt;
+  feetY += velY * dt;
+  const ground = groundAt(player.x, player.z, prevFeet);
+  onGround = false;
+  // Land on the ground. If you were already standing and the ground drops a
+  // little, stick to it so you walk down slopes instead of hopping.
+  if (feetY <= ground || (wasOnGround && feetY - ground < 0.35)) { feetY = ground; velY = 0; onGround = true; }
+
+  avatar.position.set(player.x, feetY, player.z);
+  avatar.rotation.y = heading;
+}
+
+const camGoal = new THREE.Vector3();
+const camLook = new THREE.Vector3();
+function placeCamera(dt) {
+  if (camMode === 'first') {
+    camera.position.set(player.x, feetY + EYE, player.z);
+    camera.rotation.set(pitch, yaw, 0);
+  } else if (camMode === 'third') {
+    // Sit behind you, looking the way you look
+    camLook.set(player.x, feetY + 1.3, player.z);
+    const cp = Math.cos(pitch), sp = Math.sin(pitch);
+    camera.position.set(
+      camLook.x + Math.sin(yaw) * cp * thirdDist,
+      Math.max(0.3, camLook.y - sp * thirdDist),
+      camLook.z + Math.cos(yaw) * cp * thirdDist
+    );
+    camera.lookAt(camLook);
+  } else {
+    // Orbit the creature. The target glides after it so the camera stays smooth.
+    camGoal.set(creature.pos.x, creature.bodyY * 0.7, creature.pos.z);
+    obsTarget.lerp(camGoal, Math.min(1, dt * 6));
+    const cp = Math.cos(orbitPitch);
+    camera.position.set(
+      obsTarget.x + Math.sin(orbitYaw) * cp * orbitDist,
+      obsTarget.y + Math.sin(orbitPitch) * orbitDist,
+      obsTarget.z + Math.cos(orbitYaw) * cp * orbitDist
+    );
+    camera.lookAt(obsTarget);
+  }
+}
+
+// =====================================================================
+// PART C: THE CREATURE TOOLKIT
+// ---------------------------------------------------------------------
+// Three pieces, designed to be reused for any creature:
+//   1. A creature "spec": plain data describing a body and a list of legs.
+//      Legs can be anywhere on the body, any length, any count.
+//   2. findNeighbors(): looks at where the legs are and works out which legs
+//      must not lift at the same time. This is what produces the gait.
+//   3. class Creature: builds the shapes from a spec and does the walking.
+//
+// A hand-written spec looks like this:
+//   { body: { length: 2, width: 1, height: 1 },
+//     legs: [ { hipX: 0.5, hipZ: 0.8, length: 2, thickness: 0.1, footSize: 0.25 }, ... ] }
+//   hipX: which side of the body (positive = left, negative = right). The creature
+//         attaches the leg to the body edge by itself, so legs never float away.
+//   hipZ: how far along the body (positive = front)
+// =====================================================================
+
+// Shapes shared by every creature
+const UP = new THREE.Vector3(0, 1, 0);
+const cylGeo = new THREE.CylinderGeometry(1, 1, 1, 12);   // a unit cylinder we stretch into limbs
+const sphGeo = new THREE.SphereGeometry(1, 20, 14);       // a unit sphere we squash into body, knees, feet
+const matLeg  = new THREE.MeshLambertMaterial({ color: 0x5b4a42 });
+const matFoot = new THREE.MeshLambertMaterial({ color: 0x2a2420 });
+
+function makeMesh(geo, mat, parent) {
+  const m = new THREE.Mesh(geo, mat);
+  m.castShadow = true;
+  parent.add(m);
+  return m;
+}
+
+// ---- Gait: which legs are neighbors? ---------------------------------
+// Rule: a leg may only lift when none of its neighbors are in the air.
+// Neighbors are found from the hip positions, so it works for any layout:
+//   - the nearest leg on the other side of the body
+//   - the next leg in front and the next leg behind, on the same side
+// This one rule gives a different walk for each body automatically:
+//   2 legs: left and right take turns (walking)
+//   4 legs: diagonal pairs move together (trotting)
+//   6 legs: alternating groups of three (insect tripod)
+//   8 legs: a rippling wave
+function findNeighbors(legs) {
+  for (const l of legs) l.neighbors = [];
+  const link = (a, b) => {
+    if (a && b && a !== b && !a.neighbors.includes(b)) { a.neighbors.push(b); b.neighbors.push(a); }
+  };
+  for (const a of legs) {
+    let ahead = null, behind = null, across = null;
+    for (const b of legs) {
+      if (b === a) continue;
+      if (b.side === a.side) {
+        if (b.hipZ > a.hipZ && (!ahead || b.hipZ < ahead.hipZ)) ahead = b;
+        if (b.hipZ < a.hipZ && (!behind || b.hipZ > behind.hipZ)) behind = b;
+        if (b.hipZ === a.hipZ) link(a, b);
+      } else {
+        const d = Math.hypot(b.hipX - a.hipX, b.hipZ - a.hipZ);
+        if (!across || d < across.d) across = { leg: b, d };
+      }
+    }
+    link(a, ahead);
+    link(a, behind);
+    if (across) link(a, across.leg);
+  }
+}
+
+// Spots around the body where we check the ground. Each one is
+// [x, z, depth, hard, extra]:
+//   x and z place the spot: a fraction of the body's half-width and half-length,
+//   extra is extra distance beyond the body's edge (for spots outside it),
+//   depth is how deep the body's curved underside goes at that spot (1 = deepest),
+//   hard = true for spots under the body: the body must never sink below the ground there,
+//   hard = false for spots just ahead of the body: they only make it start rising early.
+const BODY_SAMPLES = [];
+for (let i = -5; i <= 5; i++) {
+  for (let j = -5; j <= 5; j++) {
+    const nx = i / 5, nz = j / 5, r2 = nx * nx + nz * nz;
+    if (r2 < 1) BODY_SAMPLES.push([nx, nz, Math.sqrt(1 - r2), true, 0]);
+  }
+}
+for (const [extra, depth] of [[0.4, 0.9], [0.9, 0.6], [1.5, 0.35]]) {
+  for (let k = 0; k < 16; k++) {
+    const a = (k / 16) * Math.PI * 2;
+    BODY_SAMPLES.push([Math.cos(a), Math.sin(a), depth, false, extra]);
+  }
+}
+
+const AXIS_Z = new THREE.Vector3(0, 0, 1);
+
+// How close do two line segments (p1-q1 and p2-q2) get? Fills in res with the
+// distance, where along each segment the closest points are (s and t, from 0 to 1),
+// and dir, the direction from the second segment's closest point to the first's.
+const _d1 = new THREE.Vector3(), _d2 = new THREE.Vector3(), _r = new THREE.Vector3();
+const _c1 = new THREE.Vector3(), _c2 = new THREE.Vector3();
+const clamp01 = v => Math.max(0, Math.min(1, v));
+function segSegClosest(p1, q1, p2, q2, res) {
+  _d1.subVectors(q1, p1); _d2.subVectors(q2, p2); _r.subVectors(p1, p2);
+  const a = _d1.dot(_d1), e = _d2.dot(_d2), f = _d2.dot(_r);
+  let s = 0, t = 0;
+  if (a > 1e-9 && e > 1e-9) {
+    const c = _d1.dot(_r), b = _d1.dot(_d2), denom = a * e - b * b;
+    s = denom > 1e-9 ? clamp01((b * f - c * e) / denom) : 0;
+    t = (b * s + f) / e;
+    if (t < 0) { t = 0; s = clamp01(-c / a); }
+    else if (t > 1) { t = 1; s = clamp01((b - c) / a); }
+  }
+  _c1.copy(p1).addScaledVector(_d1, s);
+  _c2.copy(p2).addScaledVector(_d2, t);
+  res.s = s; res.t = t;
+  res.dir.subVectors(_c1, _c2);
+  res.dist = res.dir.length();
+  return res;
+}
+
+// ---- The creature itself ---------------------------------------------
+class Creature {
+  constructor(spec, world, x, z, yaw) {
+    this.spec = spec;
+    this.world = world;
+    this.gait = Object.assign(
+      // stepTime: seconds a foot spends in the air
+      // stepHeight: how high feet lift (fraction of leg length)
+      // trigger: how far a foot may lag behind its resting spot before it steps (fraction of leg length)
+      // tilt: how much the body leans to match the ground (0 to 1)
+      // speed: walking speed multiplier
+      { stepTime: 0.28, stepHeight: 0.18, trigger: 0.28, tilt: 0.8, speed: 1 },
+      spec.gait
+    );
+
+    this.pos = new THREE.Vector3(x, 0, z);   // x/z on the floor
+    this.yaw = yaw;                          // which way it faces (0 = toward +z)
+    this.speed = 0;                          // current forward speed
+    this.fwd = 0;                            // what the controller wants: -1 to 1 (back/forward)
+    this.turn = 0;                           // what the controller wants: -1 to 1 (right/left)
+
+    // How the body is leaning: tiltA/tiltB match the slope of the ground, bank leans into turns
+    this.tiltA = 0; this.tiltB = 0; this.bank = 0;
+    this.q = new THREE.Quaternion();         // the body's full rotation
+    this._qTilt = new THREE.Quaternion();
+    this._qBank = new THREE.Quaternion();
+    this._qFoot = new THREE.Quaternion();
+    this._planeY = 0;                        // ground height under the body's center
+    this._seg = { s: 0, t: 0, dist: 0, dir: new THREE.Vector3() };
+    this._tmp = {
+      ideal: new THREE.Vector3(), hip: new THREE.Vector3(), end: new THREE.Vector3(),
+      dir: new THREE.Vector3(), pole: new THREE.Vector3(), knee: new THREE.Vector3(),
+      v: new THREE.Vector3(), o: new THREE.Vector3(), p: new THREE.Vector3(), n: new THREE.Vector3(),
+    };
+
+    this.root = new THREE.Group();
+    scene.add(this.root);
+
+    this.bodyMat = new THREE.MeshLambertMaterial({ color: spec.body.color || 0xc8553d });
+    this.bodyMesh = makeMesh(sphGeo, this.bodyMat, this.root);
+    this.bodyMesh.scale.set(spec.body.width / 2, spec.body.height / 2, spec.body.length / 2);
+
+    this.legs = spec.legs.map(def => ({
+      ...this._attachPoint(def),             // side (+1 left, -1 right) and hip position on the body
+      length: def.length, thickness: def.thickness, footSize: def.footSize,
+      upper: makeMesh(cylGeo, matLeg, this.root),
+      lower: makeMesh(cylGeo, matLeg, this.root),
+      knee:  makeMesh(sphGeo, matLeg, this.root),
+      foot:  makeMesh(sphGeo, matFoot, this.root),
+      hipJoint: makeMesh(sphGeo, matLeg, this.root),   // a round joint where the leg meets the body
+      pos:  new THREE.Vector3(),             // where the foot is in the world
+      from: new THREE.Vector3(),             // where the current step started
+      to:   new THREE.Vector3(),             // where the current step will land
+      stepping: false,                       // is the foot in the air?
+      t: 0,                                  // how far through its step (0 to 1)
+      stepDur: 0.3,                          // how long this step takes
+      arc: 0,                                // how high this step lifts
+      nrm: new THREE.Vector3(0, 1, 0),       // the slope the foot is resting on
+      lx: 0, lz: 0,                          // foot position in the body's own frame
+      hipP: new THREE.Vector3(), kneeP: new THREE.Vector3(), endP: new THREE.Vector3(),   // the leg's three joints this frame
+      neighbors: [],
+    }));
+    findNeighbors(this.legs);
+
+    // Numbers that depend on the body, so any creature shape just works
+    const lengths = this.legs.map(l => l.length);
+    this.avgLeg = lengths.reduce((a, b) => a + b, 0) / lengths.length;
+    this.standHeight = Math.min(...lengths) * 0.6;   // how high the body rides above the ground
+    this.maxSpeed = this.avgLeg * 1.1 * this.gait.speed;   // longer legs, faster creature
+    // Tallest box it can climb: while the body passes over, the legs must still reach the ground
+    // on both sides. Longer legs climb higher; a thicker body climbs less.
+    this.climbHeight = Math.max(0.2, Math.min(...lengths) * 0.8 - spec.body.height / 2 - 0.1);
+    this.radius = 0.2 + Math.max(                    // how much floor space it needs
+      spec.body.length / 2,
+      ...this.legs.map(l => Math.abs(l.hipX) + l.length * 0.45 + l.footSize)
+    );
+
+    // Start standing: every foot at its resting spot, body at the right height
+    let avg = 0;
+    for (const l of this.legs) {
+      this._restFoot(l, this.pos.x, this.pos.z, this.yaw, 0, l.pos);
+      avg += l.pos.y;
+    }
+    this.bodyY = avg / this.legs.length + this.standHeight;
+    this.q.setFromAxisAngle(UP, this.yaw);
+    this.pace = 1;                           // slows down when the ground is too hard to keep up with
+    this._strain = 0;
+    this.settle();
+  }
+
+  // Let the creature drop into a comfortable standing pose (used when it is created or moved)
+  settle() {
+    const fwd = this.fwd, turn = this.turn;
+    this.fwd = 0; this.turn = 0; this.speed = 0;
+    for (let i = 0; i < 12; i++) this.update(0.05);
+    this.fwd = fwd; this.turn = turn;
+  }
+
+  // Where on the body a leg attaches. We find the edge of the body (an
+  // ellipse seen from above) at the leg's spot along the body, then tuck the
+  // hip slightly inside it so the leg grows out of the body with no gap.
+  _attachPoint(def) {
+    const halfL = this.spec.body.length / 2, halfW = this.spec.body.width / 2;
+    const side = def.hipX >= 0 ? 1 : -1;
+    const hipZ = Math.max(-0.9, Math.min(0.9, def.hipZ / halfL)) * halfL;
+    const edge = halfW * Math.sqrt(1 - (hipZ / halfL) * (hipZ / halfL));
+    return { side, hipZ, hipX: side * edge * 0.85 };
+  }
+
+  // The resting spot for a foot if the body were at (px, pz) facing `yaw`:
+  // out to the side of its hip, a little ahead when moving, on the ground there.
+  _restFoot(leg, px, pz, yaw, lead, out) {
+    const s = Math.sin(yaw), c = Math.cos(yaw);
+    const lx = leg.hipX + leg.side * leg.length * 0.45;
+    const lz = leg.hipZ + lead;
+    out.x = px + lx * c + lz * s;
+    out.z = pz - lx * s + lz * c;
+    out.y = this.world.groundHeight(out.x, out.z);
+    return out;
+  }
+
+  // Where is a hip in the world? It rides on the body, so it tilts with it.
+  _hipWorld(l, out) {
+    out.set(l.hipX, 0, l.hipZ).applyQuaternion(this.q);
+    out.x += this.pos.x; out.y += this.bodyY; out.z += this.pos.z;
+    return out;
+  }
+
+  // ---- BODY TILT -------------------------------------------------------
+  // Fit a flat plane through the feet (least squares) and lean the body to
+  // match it: nose up on an uphill, rolled sideways on a side slope.
+  _updateOrientation(dt) {
+    const legs = this.legs, T = this._tmp;
+    const s = Math.sin(this.yaw), c = Math.cos(this.yaw);
+
+    // Each foot (or where it will land, if it is in the air) in the body's own frame
+    let mx = 0, mz = 0, my = 0;
+    for (const l of legs) {
+      const f = l.stepping ? l.to : l.pos;
+      const dx = f.x - this.pos.x, dz = f.z - this.pos.z;
+      l.lx = dx * c - dz * s;
+      l.lz = dx * s + dz * c;
+      mx += l.lx; mz += l.lz; my += f.y;
+    }
+    const n = legs.length;
+    mx /= n; mz /= n; my /= n;
+
+    let sxx = 0, szz = 0, sxz = 0, sxy = 0, szy = 0;
+    for (const l of legs) {
+      const f = l.stepping ? l.to : l.pos;
+      const ax = l.lx - mx, az = l.lz - mz, ay = f.y - my;
+      sxx += ax * ax; szz += az * az; sxz += ax * az; sxy += ax * ay; szy += az * ay;
+    }
+    const eps = 0.05;                                  // keeps it stable when feet line up (like two legs)
+    const det = (sxx + eps) * (szz + eps) - sxz * sxz;
+    let A = (sxy * (szz + eps) - sxz * szy) / det;     // slope of the ground sideways
+    let B = ((sxx + eps) * szy - sxz * sxy) / det;     // slope of the ground front to back
+    this._planeY = my - A * mx - B * mz;               // ground height right under the body's center
+
+    A *= this.gait.tilt; B *= this.gait.tilt;
+    const slope = Math.hypot(A, B), maxSlope = 0.65;   // don't lean past about 33 degrees
+    if (slope > maxSlope) { A *= maxSlope / slope; B *= maxSlope / slope; }
+
+    const k = Math.min(1, dt * 5);                     // ease toward the new lean, don't snap
+    this.tiltA += (A - this.tiltA) * k;
+    this.tiltB += (B - this.tiltB) * k;
+
+    // Lean into turns, like a bike
+    const bankTarget = -Math.max(-1, Math.min(1, this.turn)) * (this.speed / this.maxSpeed) * 0.15;
+    this.bank += (bankTarget - this.bank) * Math.min(1, dt * 4);
+
+    T.n.set(-this.tiltA, 1, -this.tiltB).normalize();  // which way is "up" for the tilted body
+    this._qTilt.setFromUnitVectors(UP, T.n);
+    this._qBank.setFromAxisAngle(AXIS_Z, this.bank);
+    this.q.setFromAxisAngle(UP, this.yaw).multiply(this._qTilt).multiply(this._qBank);
+  }
+
+  // ---- STEPPING --------------------------------------------------------
+  // Pick where a foot will land. We try a small grid of spots around the
+  // ideal one and give each a "cost" (lower is better):
+  //   - far from the ideal spot costs more
+  //   - steep or bumpy ground, and spots near a cliff or box edge, cost more
+  //   - spots the leg can barely reach cost more
+  //   - spots on the wrong side of the body, too close to another foot, or that
+  //     would put this foot in front of / behind a neighbor it should not pass
+  //     cost a lot (that is what makes legs cross each other)
+  // fx, fz, fyaw describe where the body will be when the foot lands.
+  _chooseLanding(l, fx, fz, fyaw, lead, out) {
+    const w = this.world, L = l.length, T = this._tmp;
+    const s = Math.sin(fyaw), c = Math.cos(fyaw);
+    const lx0 = l.hipX + l.side * L * 0.45, lz0 = l.hipZ + lead;     // the ideal spot, in the body's frame
+
+    // Where the other feet are (or will land), in that same frame
+    const others = [];
+    for (const o of this.legs) {
+      if (o === l) continue;
+      const f = o.stepping ? o.to : o.pos;
+      const dx = f.x - fx, dz = f.z - fz;
+      others.push({ o, lx: dx * c - dz * s, lz: dx * s + dz * c });
+    }
+
+    // Where the hip will be when the foot lands (the body keeps moving while the foot swings)
+    this._hipWorld(l, T.hip);
+    const hipX = T.hip.x + (fx - this.pos.x), hipY = T.hip.y, hipZ = T.hip.z + (fz - this.pos.z);
+
+    const restY = w.groundHeight(fx + lx0 * c + lz0 * s, fz - lx0 * s + lz0 * c);
+    const step = L * 0.12, e = 0.3;
+    let best = Infinity;
+    for (let i = -2; i <= 2; i++) {
+      for (let j = -2; j <= 2; j++) {
+        const ox = i * step, oz = j * step;
+        const lx = lx0 + ox, lz = lz0 + oz;
+        const x = fx + lx * c + lz * s, z = fz - lx * s + lz * c;
+        const y = w.groundHeight(x, z);
+
+        let cost = Math.hypot(ox, oz) / L;                            // stay near the ideal spot
+        const y1 = w.groundHeight(x + e, z), y2 = w.groundHeight(x - e, z);
+        const y3 = w.groundHeight(x, z + e), y4 = w.groundHeight(x, z - e);
+        const slope = Math.hypot(y1 - y2, y3 - y4) / (2 * e);
+        const drop = Math.max(Math.abs(y1 - y), Math.abs(y2 - y), Math.abs(y3 - y), Math.abs(y4 - y));
+        cost += Math.min(slope, 2) * 0.5;                              // prefer flatter ground
+        if (drop > 0.35) cost += 1.5 + drop * 0.5;                     // avoid cliffs and box edges
+        cost += Math.abs(y - restY) * 0.4;                             // prefer the same height as the ideal spot
+
+        const reach = Math.hypot(hipX - x, hipY - (y + l.footSize * 0.45), hipZ - z) / L;
+        if (reach > 0.92) cost += (reach - 0.92) * 10;                 // avoid spots at the edge of reach
+
+        const farEnough = Math.abs(l.hipX) + 0.15 * L;                 // stay on this leg's own side of the body
+        if (lx * l.side < farEnough) cost += 6 + (farEnough - lx * l.side) * 10;
+
+        for (const { o, lx: olx, lz: olz } of others) {
+          const sep = (l.footSize + o.footSize) * 1.4;
+          const d = Math.hypot(lx - olx, lz - olz);
+          if (d < sep) cost += (sep - d) * 8;                          // do not stand on another foot
+          if (o.side === l.side && o.hipZ !== l.hipZ) {                // keep the order of legs along the body
+            const gap = Math.min(sep, Math.abs(o.hipZ - l.hipZ) * 0.7);
+            if (o.hipZ > l.hipZ && lz > olz - gap) cost += (lz - (olz - gap)) * 12;
+            if (o.hipZ < l.hipZ && lz < olz + gap) cost += ((olz + gap) - lz) * 12;
+          }
+        }
+        if (cost < best) { best = cost; out.set(x, y, z); }
+      }
+    }
+    return out;
+  }
+
+  _startStep(l) {
+    const g = this.gait, T = this._tmp;
+    const speedFrac = Math.min(1, Math.abs(this.speed) / this.maxSpeed);
+    const t0 = g.stepTime * (1 - 0.3 * speedFrac);     // faster walking, quicker steps
+
+    // Pick the landing spot ONCE, for where the body will be when the foot lands.
+    // (Aiming at a moving target every frame is what made feet jump around.)
+    const futureYaw = this.yaw + this.turn * 1.6 * t0;
+    const futureX = this.pos.x + Math.sin(this.yaw) * this.speed * t0;
+    const futureZ = this.pos.z + Math.cos(this.yaw) * this.speed * t0;
+    // Land a little AHEAD of the resting spot: as the body walks past, the foot ends up as far
+    // behind as it started ahead, so the legs stay centered under the body instead of trailing.
+    const lead = Math.sign(this.speed) * speedFrac * l.length * g.trigger * 0.9;
+    this._chooseLanding(l, futureX, futureZ, futureYaw, lead, l.to);
+    l.from.copy(l.pos);
+
+    // Lift high enough to clear the highest ground along the way (like a box edge)
+    const flat = Math.hypot(l.to.x - l.from.x, l.to.z - l.from.z);
+    const rise = l.to.y - l.from.y;
+    let top = Math.max(l.from.y, l.to.y);
+    for (let i = 1; i < 6; i++) {
+      const f = i / 6;
+      top = Math.max(top, this.world.groundHeight(
+        l.from.x + (l.to.x - l.from.x) * f, l.from.z + (l.to.z - l.from.z) * f));
+    }
+    l.arc = Math.max(l.length * g.stepHeight, top + 0.12 - (l.from.y + l.to.y) / 2);
+
+    // Never move a foot faster than a believable speed: long or high steps take longer
+    const pathLength = flat + 2 * l.arc + Math.abs(rise);
+    const footSpeedCap = Math.max(this.avgLeg * 3.2, Math.abs(this.speed) * 2.6);
+    l.stepDur = Math.max(t0, pathLength / footSpeedCap);
+
+    l.stepping = true;
+    l.t = 0;
+  }
+
+  update(dt) {
+    const g = this.gait, T = this._tmp, legs = this.legs;
+
+    // 1. Move the whole creature using what the controller asked for
+    // If the feet are falling behind (hard ground), ease off like an animal picking its way
+    const paceTarget = this._strain > 1.15 ? Math.max(0.3, 1.15 / this._strain) : 1;
+    this.pace += (paceTarget - this.pace) * Math.min(1, dt * 6);
+    this.speed += (this.fwd * this.maxSpeed * this.pace - this.speed) * Math.min(1, dt * 4);
+    this.yaw += this.turn * 1.6 * dt;
+    this.pos.x += Math.sin(this.yaw) * this.speed * dt;
+    this.pos.z += Math.cos(this.yaw) * this.speed * dt;
+    const idle = Math.abs(this.speed) < 0.05 && Math.abs(this.turn) < 0.05;
+
+    // 2. Lean the body to match the ground under the feet
+    this._updateOrientation(dt);
+
+    // 3. Decide which planted feet should start a step.
+    //    A foot steps when it lags behind its resting spot, or when its leg is
+    //    stretched too far. When standing still, feet tidy themselves up.
+    let lifted = 0;
+    for (const l of legs) if (l.stepping) lifted++;
+    const maxLifted = Math.max(1, Math.floor(legs.length / 2));     // at least half the feet stay down
+    const emergencyMax = Math.max(1, legs.length - 2);              // an over-stretched leg may step anyway
+    const wants = [];
+    let strain = 0;
+    for (const l of legs) {
+      if (l.stepping) continue;
+      this._restFoot(l, this.pos.x, this.pos.z, this.yaw, 0, T.ideal);
+      const lag = Math.hypot(T.ideal.x - l.pos.x, T.ideal.z - l.pos.z);
+      this._hipWorld(l, T.hip);
+      const stretch = Math.hypot(T.hip.x - l.pos.x, T.hip.y - (l.pos.y + l.footSize * 0.45), T.hip.z - l.pos.z) / l.length;
+      const trigger = idle ? g.trigger * 0.5 : g.trigger;
+      const urgency = Math.max(lag / (l.length * trigger), (stretch - 0.72) / 0.22);
+      strain = Math.max(strain, urgency);
+      if (urgency > 1) wants.push({ l, urgency, stretch });
+    }
+    this._strain = strain;                             // how far behind the feet are (used to set the pace)
+    wants.sort((a, b) => b.urgency - a.urgency);       // the most overdue foot goes first
+    for (const w of wants) {
+      const emergency = w.stretch > 1.0;               // the leg is stretched past its reach
+      if (lifted >= (emergency ? emergencyMax : maxLifted)) continue;
+      if (!emergency && w.l.neighbors.some(n => n.stepping)) continue;   // the gait rule
+      this._startStep(w.l);
+      lifted++;
+    }
+
+    // 4. Move the feet
+    for (const l of legs) {
+      if (l.stepping) {
+        l.t += dt / l.stepDur;
+        const k = Math.min(l.t, 1);
+        const e = smooth01(k);
+        l.pos.x = l.from.x + (l.to.x - l.from.x) * e;
+        l.pos.z = l.from.z + (l.to.z - l.from.z) * e;
+        // Going up: rise early so the foot clears the edge. Going down: drop late.
+        const ey = (l.to.y >= l.from.y) ? smooth01(Math.min(1, k * 1.8)) : smooth01(Math.max(0, (k - 0.45) / 0.55));
+        l.pos.y = l.from.y + (l.to.y - l.from.y) * ey + Math.sin(Math.PI * k) * l.arc;
+        if (l.t >= 1) { l.stepping = false; l.pos.copy(l.to); }
+      } else {
+        // A planted foot stays put, but follows the ground if the ground changes
+        const gy = this.world.groundHeight(l.pos.x, l.pos.z);
+        l.pos.y += (gy - l.pos.y) * Math.min(1, dt * 15);
+      }
+    }
+
+    // 5. Body height
+    // 5a. Where does it want to ride? A set height above the ground under the body.
+    //     But never so high or low that a leg can't reach its foot.
+    let lowest = -Infinity, highest = Infinity;
+    for (const l of legs) {
+      T.o.set(l.hipX, 0, l.hipZ).applyQuaternion(this.q);   // the hip's offset from the body center
+      const sideways = Math.hypot(this.pos.x + T.o.x - l.pos.x, this.pos.z + T.o.z - l.pos.z);
+      const reach = l.length * 0.96;
+      const upDown = Math.sqrt(Math.max(0, reach * reach - sideways * sideways));   // how far up or down the leg can still reach
+      const footY = l.pos.y + l.footSize * 0.45;
+      lowest = Math.max(lowest, footY - upDown - T.o.y);
+      highest = Math.min(highest, footY + upDown - T.o.y);
+    }
+    let targetY = this._planeY + this.standHeight;
+    targetY = lowest > highest ? (lowest + highest) / 2 : Math.max(lowest, Math.min(highest, targetY));
+
+    // 5b. Keep the body out of the ground: check the ground under and just
+    //     ahead of the (tilted) body, and make sure its curved underside clears it.
+    const halfW = this.spec.body.width / 2, halfL = this.spec.body.length / 2, halfH = this.spec.body.height / 2;
+    let hardFloor = -Infinity, softFloor = -Infinity;
+    for (const [nx, nz, depth, hard, extra] of BODY_SAMPLES) {
+      T.p.set(nx * (halfW + extra), -halfH * depth, nz * (halfL + extra)).applyQuaternion(this.q);   // that spot on the body's underside
+      const ground = this.world.groundHeight(this.pos.x + T.p.x, this.pos.z + T.p.z, this.climbHeight);
+      const need = ground + 0.1 - T.p.y;                // how high the body center must be
+      if (hard) hardFloor = Math.max(hardFloor, need);
+      else softFloor = Math.max(softFloor, need);
+    }
+    targetY = Math.max(targetY, softFloor, hardFloor);
+    const rate = targetY > this.bodyY ? 12 : 7;         // rise quickly, settle gently
+    this.bodyY += (targetY - this.bodyY) * Math.min(1, dt * rate);
+    this.bodyY = Math.max(this.bodyY, hardFloor);       // never sink into the ground
+
+    // 6. Place the shapes
+    this.bodyMesh.position.set(this.pos.x, this.bodyY, this.pos.z);
+    this.bodyMesh.quaternion.copy(this.q);
+    for (const l of legs) this._solveLegIK(l);
+    this._separateLegs();
+    for (const l of legs) this._placeLeg(l, dt);
+  }
+
+  // Two-bone leg IK: the hip is on the body, the foot is on the ground, and
+  // the leg has two equal bones. The knee sits halfway between them, pushed
+  // out sideways by an amount we get from Pythagoras. Saves the three joints.
+  _solveLegIK(l) {
+    const { hip, end, dir, pole, knee, v } = this._tmp;
+
+    this._hipWorld(l, hip);
+    const footLift = l.footSize * 0.45;
+    end.set(l.pos.x, l.pos.y + footLift, l.pos.z);
+
+    // If the foot is out of reach, stretch toward it as far as the leg goes
+    v.subVectors(end, hip);
+    let dist = v.length();
+    const maxDist = l.length * 0.999;
+    if (dist > maxDist) {
+      v.multiplyScalar(maxDist / dist);
+      dist = maxDist;
+      end.copy(hip).add(v);
+    }
+    dir.copy(v).divideScalar(dist);                  // direction from hip to foot
+
+    // Knees bend up and a little outward (relative to the tilted body), like a spider
+    pole.set(l.side * 0.6, 1, 0).applyQuaternion(this.q);
+    pole.addScaledVector(dir, -pole.dot(dir)).normalize();
+
+    const half = l.length / 2;
+    const a = dist / 2;
+    const h = Math.sqrt(Math.max(0, half * half - a * a));
+    knee.copy(hip).addScaledVector(dir, a).addScaledVector(pole, h);
+
+    l.hipP.copy(hip); l.kneeP.copy(knee); l.endP.copy(end);
+  }
+
+  // Last safety net: if two neighboring legs would pass through each other, push
+  // their knees apart. (Choosing good landing spots already prevents most of this.)
+  _separateLegs() {
+    const legs = this.legs, res = this._seg;
+    for (let pass = 0; pass < 2; pass++) {
+      for (let i = 0; i < legs.length; i++) {
+        const a = legs[i];
+        for (const b of a.neighbors) {
+          if (legs.indexOf(b) < i) continue;                // check each pair once
+          const minDist = a.thickness + b.thickness + 0.04;
+          for (let sa = 0; sa < 2; sa++) {                   // sa: 0 = upper bone, 1 = lower bone
+            for (let sb = 0; sb < 2; sb++) {
+              segSegClosest(sa === 0 ? a.hipP : a.kneeP, sa === 0 ? a.kneeP : a.endP,
+                            sb === 0 ? b.hipP : b.kneeP, sb === 0 ? b.kneeP : b.endP, res);
+              if (res.dist >= minDist) continue;
+              if (res.dist > 1e-5) res.dir.divideScalar(res.dist);
+              else res.dir.subVectors(a.hipP, b.hipP).add(UP).normalize();
+              const push = (minDist - res.dist) * 0.5;
+              // Only the knee can move (hip and foot are fixed), so it has to move more
+              // than the spot where the legs touch.
+              const wa = sa === 0 ? res.s : 1 - res.s, wb = sb === 0 ? res.t : 1 - res.t;
+              const cap = 0.3 * Math.min(a.length, b.length);
+              a.kneeP.addScaledVector(res.dir, Math.min(cap, push / Math.max(wa, 0.35)));
+              b.kneeP.addScaledVector(res.dir, -Math.min(cap, push / Math.max(wb, 0.35)));
+            }
+          }
+        }
+      }
+    }
+  }
+
+  // Put the leg's shapes where its joints are
+  _placeLeg(l, dt) {
+    const n = this._tmp.n;
+    l.hipJoint.position.copy(l.hipP);
+    l.hipJoint.scale.setScalar(l.thickness * 1.3);
+    this._placeLimb(l.upper, l.hipP, l.kneeP, l.thickness);
+    this._placeLimb(l.lower, l.kneeP, l.endP, l.thickness * 0.8);
+    l.knee.position.copy(l.kneeP);
+    l.knee.scale.setScalar(l.thickness * 1.1);
+
+    // The foot lies flat on the slope it stands on (and levels out while in the air)
+    n.set(0, 1, 0);
+    if (!l.stepping) {
+      const e = 0.25, w = this.world;
+      const gx = (w.groundHeight(l.pos.x + e, l.pos.z) - w.groundHeight(l.pos.x - e, l.pos.z)) / (2 * e);
+      const gz = (w.groundHeight(l.pos.x, l.pos.z + e) - w.groundHeight(l.pos.x, l.pos.z - e)) / (2 * e);
+      const slope = Math.hypot(gx, gz);
+      if (slope < 1.5) {                               // a very steep "slope" is really a box edge, so ignore it
+        const k = slope > 0.8 ? 0.8 / slope : 1;
+        n.set(-gx * k, 1, -gz * k).normalize();
+      }
+    }
+    l.nrm.lerp(n, Math.min(1, dt * 12)).normalize();
+    this._qFoot.setFromUnitVectors(UP, l.nrm);
+    l.foot.position.copy(l.endP);                      // the foot rides at the end of the leg
+    l.foot.scale.set(l.footSize, l.footSize * 0.5, l.footSize * 1.3);
+    l.foot.quaternion.setFromAxisAngle(UP, this.yaw).premultiply(this._qFoot);
+  }
+
+  // Stretch a unit cylinder so it runs from point a to point b
+  _placeLimb(mesh, a, b, thickness) {
+    const v = this._tmp.v;
+    v.subVectors(b, a);
+    const len = v.length();
+    if (len < 1e-5) return;
+    mesh.position.copy(a).addScaledVector(v, 0.5);
+    mesh.scale.set(thickness, len, thickness);
+    mesh.quaternion.setFromUnitVectors(UP, v.divideScalar(len));
+  }
+
+  dispose() {
+    scene.remove(this.root);
+    this.bodyMat.dispose();
+  }
+}
+
+// ---- A quick way to make specs from a few numbers --------------------
+// Legs come in left/right pairs spread along the body. An odd number of legs
+// just leaves the last pair with one leg, which makes a lopsided creature.
+function specFromParams(p) {
+  const rows = Math.ceil(p.legs / 2);
+  const legs = [];
+  for (let i = 0; i < p.legs; i++) {
+    const side = (i % 2 === 0) ? 1 : -1;
+    const row = Math.floor(i / 2);
+    const z = (rows === 1) ? 0 : p.bodyLength * 0.4 * (1 - 2 * row / (rows - 1));
+    legs.push({ hipX: side, hipZ: z, length: p.legLength, thickness: p.thickness, footSize: p.footSize });
+  }
+  return {
+    body: { length: p.bodyLength, width: p.bodyWidth, height: p.bodyHeight },
+    legs,
+    gait: { stepHeight: p.stepHeight, tilt: p.tilt, speed: p.speed },
+  };
+}
+
+// ---- A controller: this one makes the creature wander around ----------
+// The creature never decides where to walk. It only follows fwd/turn.
+// Anything can set those: this wander code, the keyboard, or later an AI.
+const wander = { x: 0, z: 0, timer: 0 };
+
+function pickWaypoint(c) {
+  for (let i = 0; i < 30; i++) {
+    const x = (Math.random() * 2 - 1) * 20, z = (Math.random() * 2 - 1) * 20;
+    const clear = boxes.every(b => b.height <= c.climbHeight || Math.abs(x - b.x) > b.half + c.radius + 1 || Math.abs(z - b.z) > b.half + c.radius + 1);
+    if (clear) { wander.x = x; wander.z = z; break; }
+  }
+  wander.timer = 8;                      // give up on a target after 8 seconds
+}
+
+function steerWander(c, dt) {
+  wander.timer -= dt;
+  let dx = wander.x - c.pos.x, dz = wander.z - c.pos.z;
+  if (Math.hypot(dx, dz) < 1.5 || wander.timer <= 0) { pickWaypoint(c); dx = wander.x - c.pos.x; dz = wander.z - c.pos.z; }
+
+  // Head for the target, but get nudged away from boxes it can't climb and from the edge
+  const dist = Math.hypot(dx, dz) || 1;
+  let dirX = dx / dist, dirZ = dz / dist;
+  for (const b of boxes) {
+    if (b.height <= c.climbHeight) continue;
+    const bx = c.pos.x - b.x, bz = c.pos.z - b.z;
+    const d = Math.hypot(bx, bz) || 0.01;
+    const range = b.half * 1.5 + c.radius + 2.5;
+    if (d < range) {
+      const push = (1 - d / range) * 2.5;
+      dirX += (bx / d) * push;
+      dirZ += (bz / d) * push;
+    }
+  }
+  const edge = LIMIT - 4;
+  if (Math.abs(c.pos.x) > edge) dirX -= Math.sign(c.pos.x) * 1.5;
+  if (Math.abs(c.pos.z) > edge) dirZ -= Math.sign(c.pos.z) * 1.5;
+
+  let diff = Math.atan2(dirX, dirZ) - c.yaw;       // how far to turn to face that way
+  diff = Math.atan2(Math.sin(diff), Math.cos(diff));   // wrap into -180..180 degrees
+  c.turn = Math.max(-1, Math.min(1, diff * 1.5));
+  c.fwd = Math.abs(diff) < 1.0 ? 1 : 0.25;         // slow down for sharp turns
+}
+
+// Drive the creature with the keyboard. The keys are relative to the view, so
+// W walks it away from the camera. Same fwd/turn controls the wander code uses.
+function steerByKeys(c) {
+  const m = readMoveInput(viewHeading());
+  if (m.x === 0 && m.z === 0) { c.fwd = 0; c.turn = 0; return; }
+  let diff = Math.atan2(m.x, m.z) - c.yaw;         // how far to turn to face the wanted direction
+  diff = Math.atan2(Math.sin(diff), Math.cos(diff));
+  c.turn = Math.max(-1, Math.min(1, diff * 3));
+  c.fwd = Math.abs(diff) < 1.2 ? 1 : 0.15;
+}
+
+// Keep creatures out of boxes and on the floor
+function keepCreatureInWorld(c) {
+  for (const b of boxes) {
+    if (b.height <= c.climbHeight) continue;       // low enough to climb, so it is not a wall
+    const dx = c.pos.x - b.x, dz = c.pos.z - b.z;
+    const limit = b.half + c.radius;
+    if (Math.abs(dx) < limit && Math.abs(dz) < limit) {
+      if (limit - Math.abs(dx) < limit - Math.abs(dz)) c.pos.x = b.x + Math.sign(dx || 1) * limit;
+      else c.pos.z = b.z + Math.sign(dz || 1) * limit;
+    }
+  }
+  const edge = LIMIT - 1;
+  c.pos.x = Math.max(-edge, Math.min(edge, c.pos.x));
+  c.pos.z = Math.max(-edge, Math.min(edge, c.pos.z));
+}
+
+// =====================================================================
+// PART D: THE CREATURE PANEL (sliders and presets)
+// =====================================================================
+const params = { legs: 4, legLength: 2.0, thickness: 0.12, bodyLength: 2.0, bodyWidth: 1.2, bodyHeight: 0.9, footSize: 0.25,
+                 stepHeight: 0.18, tilt: 0.8, speed: 1 };
+
+// [setting, label, min, max, step]
+const sliderDefs = [
+  ['legs',       'Legs',          2,    8,   1],
+  ['legLength',  'Leg length',    0.8,  3.5, 0.1],
+  ['thickness',  'Leg thickness', 0.04, 0.3, 0.01],
+  ['bodyLength', 'Body length',   1,    4,   0.1],
+  ['bodyWidth',  'Body width',    0.6,  3,   0.1],
+  ['bodyHeight', 'Body height',   0.4,  2,   0.1],
+  ['footSize',   'Foot size',     0.1,  0.6, 0.02],
+  ['stepHeight', 'Step height',   0.05, 0.4, 0.01],
+  ['tilt',       'Body tilt',     0,    1,   0.05],
+  ['speed',      'Walk speed',    0.5,  2,   0.1],
+];
+
+const presets = {
+  'Spider (8)':  { legs: 8, legLength: 2.2, thickness: 0.10, bodyLength: 1.6, bodyWidth: 1.4, bodyHeight: 0.8, footSize: 0.20 },
+  'Dog (4)':     { legs: 4, legLength: 1.6, thickness: 0.16, bodyLength: 3.0, bodyWidth: 1.0, bodyHeight: 1.0, footSize: 0.25 },
+  'Beetle (6)':  { legs: 6, legLength: 1.4, thickness: 0.10, bodyLength: 2.4, bodyWidth: 1.2, bodyHeight: 0.7, footSize: 0.20 },
+  'Bird (2)':    { legs: 2, legLength: 2.4, thickness: 0.14, bodyLength: 1.2, bodyWidth: 1.2, bodyHeight: 1.4, footSize: 0.35 },
+  'Oddball (5)': { legs: 5, legLength: 2.0, thickness: 0.12, bodyLength: 2.8, bodyWidth: 1.6, bodyHeight: 1.0, footSize: 0.25 },
+  'Stilts (4)':  { legs: 4, legLength: 3.5, thickness: 0.20, bodyLength: 2.6, bodyWidth: 1.2, bodyHeight: 1.2, footSize: 0.40 },
+};
+
+let creature = null;
+function respawnCreature() {
+  let x = -4, z = 12, yawNow = 0;
+  if (creature) { x = creature.pos.x; z = creature.pos.z; yawNow = creature.yaw; creature.dispose(); }
+  creature = new Creature(specFromParams(params), world, x, z, yawNow);
+  wander.timer = 0;                      // pick a fresh target
+}
+
+const sliderRefs = {};
+const slidersDiv = document.getElementById('sliders');
+for (const [key, label, min, max, step] of sliderDefs) {
+  const row = document.createElement('label');
+  row.className = 'row';
+  row.innerHTML = '<span>' + label + ' <b></b></span><input type="range">';
+  const input = row.querySelector('input');
+  const value = row.querySelector('b');
+  input.min = min; input.max = max; input.step = step;
+  input.addEventListener('input', () => {
+    params[key] = Number(input.value);
+    value.textContent = params[key];
+    respawnCreature();
+  });
+  input.addEventListener('change', () => input.blur());    // so W A S D keep working afterwards
+  sliderRefs[key] = { input, value };
+  slidersDiv.appendChild(row);
+}
+function refreshSliders() {
+  for (const key in sliderRefs) {
+    sliderRefs[key].input.value = params[key];
+    sliderRefs[key].value.textContent = params[key];
+  }
+}
+
+const presetsDiv = document.getElementById('presets');
+for (const name in presets) {
+  const btn = document.createElement('button');
+  btn.textContent = name;
+  btn.addEventListener('click', () => {
+    Object.assign(params, presets[name]);
+    refreshSliders();
+    respawnCreature();
+    btn.blur();
+  });
+  presetsDiv.appendChild(btn);
+}
+document.getElementById('wander').addEventListener('change', e => e.target.blur());
+
+// Terrain roughness slider
+(function buildTerrainSlider() {
+  const row = document.createElement('label');
+  row.className = 'row';
+  row.innerHTML = '<span>Roughness <b></b></span><input type="range" min="0" max="2" step="0.1">';
+  const input = row.querySelector('input'), value = row.querySelector('b');
+  input.value = roughness;
+  value.textContent = roughness;
+  input.addEventListener('input', () => {
+    roughness = Number(input.value);
+    value.textContent = roughness;
+    rebuildTerrain();
+  });
+  input.addEventListener('change', () => input.blur());
+  document.getElementById('terrainBox').appendChild(row);
+})();
+
+// =====================================================================
+// PART E: THE MAIN LOOP
+// =====================================================================
+const clock = new THREE.Clock();
+
+function animate() {
+  requestAnimationFrame(animate);
+  const dt = Math.min(clock.getDelta(), 0.05);     // cap dt so a lag spike can't break the physics
+
+  updatePlayer(dt);
+
+  if (controlCreature) steerByKeys(creature);
+  else if (document.getElementById('wander').checked) steerWander(creature, dt);
+  else { creature.fwd = 0; creature.turn = 0; }
+  creature.update(dt);
+  keepCreatureInWorld(creature);
+
+  placeCamera(dt);
+  renderer.render(scene, camera);
+}
+
+refreshSliders();
+respawnCreature();
+setCamMode('observe');
+setControl(false);
+animate();
+</script>
+</body>
+</html>
