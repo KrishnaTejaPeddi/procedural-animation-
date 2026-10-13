@@ -45,6 +45,7 @@
   <summary>Controls</summary>
   <button id="viewBtn"></button>
   <button id="ctrlBtn"></button>
+  <div id="gaitInfo" style="margin-top:8px"></div>
   <h4>Terrain</h4>
   <div id="terrainBox"></div>
   <h4>Creature presets</h4>
@@ -455,12 +456,33 @@ for (const [extra, depth] of [[0.4, 0.9], [0.9, 0.6], [1.5, 0.35]]) {
 
 const AXIS_Z = new THREE.Vector3(0, 0, 1);
 
+// A body is a row of ellipsoid segments, listed from the front to the rear (a head, a thorax, an abdomen...).
+// A simple body is just one segment. Each segment is { length, width, height }, plus legs: true if
+// legs are meant to grow from it. This works out where each one sits along the body, with a small
+// overlap so neighbors look joined, and centers the whole row.
+function layoutBodyParts(body) {
+  const src = body.segments && body.segments.length ? body.segments
+    : [{ length: body.length, width: body.width, height: body.height, legs: true }];
+  const parts = src.map(s => ({ length: s.length, width: s.width, height: s.height, y: s.y || 0, legs: !!s.legs, zc: 0 }));
+  for (let i = 1; i < parts.length; i++) {
+    const a = parts[i - 1], b = parts[i];
+    const overlap = 0.4 * Math.min(a.length, b.length);
+    b.zc = a.zc - ((a.length + b.length) / 2 - overlap);          // each segment sits behind the one before it
+  }
+  const front = parts[0].zc + parts[0].length / 2;
+  const rear = parts[parts.length - 1].zc - parts[parts.length - 1].length / 2;
+  const mid = (front + rear) / 2;
+  for (const p of parts) p.zc -= mid;                              // center the row on the body's middle
+  return { parts, length: front - rear, width: Math.max(...parts.map(p => p.width)), height: Math.max(...parts.map(p => p.height)) };
+}
+
 // How close do two line segments (p1-q1 and p2-q2) get? Fills in res with the
 // distance, where along each segment the closest points are (s and t, from 0 to 1),
 // and dir, the direction from the second segment's closest point to the first's.
 const _d1 = new THREE.Vector3(), _d2 = new THREE.Vector3(), _r = new THREE.Vector3();
 const _c1 = new THREE.Vector3(), _c2 = new THREE.Vector3();
 const clamp01 = v => Math.max(0, Math.min(1, v));
+const wrapAngle = a => Math.atan2(Math.sin(a), Math.cos(a));   // an angle difference, wrapped into -180..180 degrees
 function segSegClosest(p1, q1, p2, q2, res) {
   _d1.subVectors(q1, p1); _d2.subVectors(q2, p2); _r.subVectors(p1, p2);
   const a = _d1.dot(_d1), e = _d2.dot(_d2), f = _d2.dot(_r);
@@ -491,12 +513,19 @@ class Creature {
       // trigger: how far a foot may lag behind its resting spot before it steps (fraction of leg length)
       // tilt: how much the body leans to match the ground (0 to 1)
       // speed: walking speed multiplier
-      { stepTime: 0.28, stepHeight: 0.18, trigger: 0.28, tilt: 0.8, speed: 1 },
+      // flex: how much the end segments of the body swing as it walks and turns (0 = stiff)
+      { stepTime: 0.28, stepHeight: 0.18, trigger: 0.28, tilt: 0.8, speed: 1, flex: 0.6 },
       spec.gait
     );
 
     this.pos = new THREE.Vector3(x, 0, z);   // x/z on the floor
     this.yaw = yaw;                          // which way it faces (0 = toward +z)
+    // The creature has two poses. The controller steers an invisible DRIVER (goalPos, goalYaw): where it
+    // wants to be. The visible body (pos, yaw) is NOT moved directly. It is placed from where the feet are,
+    // so the legs decide how the body actually moves. The driver waits if the body can't keep up.
+    this.goalPos = this.pos.clone();
+    this.goalYaw = yaw;
+    this._yawRate = 0;                       // how fast the driver is turning right now
     this.speed = 0;                          // current forward speed
     this.fwd = 0;                            // what the controller wants: -1 to 1 (back/forward)
     this.turn = 0;                           // what the controller wants: -1 to 1 (right/left)
@@ -518,9 +547,26 @@ class Creature {
     this.root = new THREE.Group();
     scene.add(this.root);
 
-    this.bodyMat = new THREE.MeshLambertMaterial({ color: spec.body.color || 0xc8553d });
-    this.bodyMesh = makeMesh(sphGeo, this.bodyMat, this.root);
-    this.bodyMesh.scale.set(spec.body.width / 2, spec.body.height / 2, spec.body.length / 2);
+    // The body: a row of ellipsoid segments inside one group that we move and tilt as a whole
+    const layout = layoutBodyParts(spec.body);
+    this.parts = layout.parts;
+    this.bodyLen = layout.length;                    // total length of the row
+    this.bodyGroup = new THREE.Group();
+    this.root.add(this.bodyGroup);
+    this.bodyMats = [];
+    this.parts.forEach((p, i) => {
+      const color = new THREE.Color(spec.body.color || 0xc8553d).multiplyScalar(1 - 0.12 * i);   // a bit darker toward the rear
+      const mat = new THREE.MeshLambertMaterial({ color });
+      this.bodyMats.push(mat);
+      p.mesh = makeMesh(sphGeo, mat, this.bodyGroup);
+      p.mesh.matrixAutoUpdate = false;               // we set each segment's matrix ourselves (see _updateParts)
+      p.mLocal = new THREE.Matrix4().compose(new THREE.Vector3(0, p.y, p.zc), new THREE.Quaternion(),
+                                             new THREE.Vector3(p.width / 2, p.height / 2, p.length / 2));
+      p.mRel = new THREE.Matrix4();                  // how this segment has swung, compared with resting in line
+      p.yaw = 0; p.yawV = 0; p.pitch = 0; p.pitchV = 0;
+    });
+    this._m1 = new THREE.Matrix4(); this._m2 = new THREE.Matrix4();
+    this._euler = new THREE.Euler(); this._qa = new THREE.Quaternion();
 
     this.legs = spec.legs.map(def => ({
       ...this._attachPoint(def),             // side (+1 left, -1 right) and hip position on the body
@@ -539,21 +585,24 @@ class Creature {
       arc: 0,                                // how high this step lifts
       nrm: new THREE.Vector3(0, 1, 0),       // the slope the foot is resting on
       lx: 0, lz: 0,                          // foot position in the body's own frame
+      poleS: new THREE.Vector3(0, 1, 0),     // smoothed knee direction (stops the knee flicking around)
+      reachMul: 1,                           // how far out this leg's foot rests (1 = normal)
       hipP: new THREE.Vector3(), kneeP: new THREE.Vector3(), endP: new THREE.Vector3(),   // the leg's three joints this frame
       neighbors: [],
     }));
     findNeighbors(this.legs);
+    this._setupParts();
 
     // Numbers that depend on the body, so any creature shape just works
     const lengths = this.legs.map(l => l.length);
     this.avgLeg = lengths.reduce((a, b) => a + b, 0) / lengths.length;
     this.standHeight = Math.min(...lengths) * 0.6;   // how high the body rides above the ground
-    this.maxSpeed = this.avgLeg * 1.1 * this.gait.speed;   // longer legs, faster creature
+    this._buildGait();                               // work out this body's walking pattern (also sets maxSpeed)
     // Tallest box it can climb: while the body passes over, the legs must still reach the ground
     // on both sides. Longer legs climb higher; a thicker body climbs less.
-    this.climbHeight = Math.max(0.2, Math.min(...lengths) * 0.8 - spec.body.height / 2 - 0.1);
+    this.climbHeight = Math.max(0.2, Math.min(...lengths) * 0.8 - this.bodyH / 2 - 0.1);
     this.radius = 0.2 + Math.max(                    // how much floor space it needs
-      spec.body.length / 2,
+      this.bodyLen / 2,
       ...this.legs.map(l => Math.abs(l.hipX) + l.length * 0.45 + l.footSize)
     );
 
@@ -564,6 +613,7 @@ class Creature {
       avg += l.pos.y;
     }
     this.bodyY = avg / this.legs.length + this.standHeight;
+    this._lastBodyY = this.bodyY;
     this.q.setFromAxisAngle(UP, this.yaw);
     this.pace = 1;                           // slows down when the ground is too hard to keep up with
     this._strain = 0;
@@ -582,18 +632,26 @@ class Creature {
   // ellipse seen from above) at the leg's spot along the body, then tuck the
   // hip slightly inside it so the leg grows out of the body with no gap.
   _attachPoint(def) {
-    const halfL = this.spec.body.length / 2, halfW = this.spec.body.width / 2;
     const side = def.hipX >= 0 ? 1 : -1;
-    const hipZ = Math.max(-0.9, Math.min(0.9, def.hipZ / halfL)) * halfL;
-    const edge = halfW * Math.sqrt(1 - (hipZ / halfL) * (hipZ / halfL));
-    return { side, hipZ, hipX: side * edge * 0.85 };
+    // which segment is this hip on? the one whose middle is closest (counting in segment lengths)
+    let part = 0, best = Infinity;
+    this.parts.forEach((p, i) => {
+      const d = Math.abs(def.hipZ - p.zc) / (p.length / 2);
+      if (d < best) { best = d; part = i; }
+    });
+    const p = this.parts[part];
+    const halfL = p.length / 2, halfW = p.width / 2;
+    const along = Math.max(-0.9, Math.min(0.9, (def.hipZ - p.zc) / halfL));
+    const hipZ = p.zc + along * halfL;
+    const edge = halfW * Math.sqrt(1 - along * along);
+    return { side, hipZ, hipX: side * edge * 0.85, part };
   }
 
   // The resting spot for a foot if the body were at (px, pz) facing `yaw`:
   // out to the side of its hip, a little ahead when moving, on the ground there.
   _restFoot(leg, px, pz, yaw, lead, out) {
     const s = Math.sin(yaw), c = Math.cos(yaw);
-    const lx = leg.hipX + leg.side * leg.length * 0.45;
+    const lx = leg.hipX + leg.side * leg.length * 0.45 * leg.reachMul;
     const lz = leg.hipZ + lead;
     out.x = px + lx * c + lz * s;
     out.z = pz - lx * s + lz * c;
@@ -606,6 +664,134 @@ class Creature {
     out.set(l.hipX, 0, l.hipZ).applyQuaternion(this.q);
     out.x += this.pos.x; out.y += this.bodyY; out.z += this.pos.z;
     return out;
+  }
+
+  // Move the whole creature somewhere else and let it settle into a standing pose
+  teleport(x, z, yaw) {
+    this.pos.set(x, 0, z); this.goalPos.set(x, 0, z);
+    this.yaw = yaw; this.goalYaw = yaw;
+    this.speed = 0; this._yawRate = 0;
+    for (const l of this.legs) { l.stepping = false; l.armed = false; this._restFoot(l, x, z, yaw, 0, l.pos); }
+    this.q.setFromAxisAngle(UP, yaw);
+    this.settle();
+  }
+
+  // ---- THE FEET PLACE THE BODY -----------------------------------------
+  // This is the heart of it. Instead of moving the body and dragging the legs
+  // along, we look at where the feet are and put the body there:
+  //   - position: the middle of the feet
+  //   - direction: the line from the left feet to the right feet, and from the rear feet
+  //     to the front feet, tell us which way the body faces
+  // So when the creature turns, the body can only rotate as far as the feet have
+  // already stepped. The legs step around first, and the body follows them.
+  _followFeet(dt) {
+    const legs = this.legs, n = legs.length;
+    let cx = 0, cz = 0, lx = 0, lz = 0, ln = 0, rx = 0, rz = 0, rn = 0;
+    let fx = 0, fz = 0, fn = 0, bx = 0, bz = 0, bn = 0;
+    for (const l of legs) {
+      const f = l.pos;                                   // where the foot is right now (it moves smoothly, so the body does too)
+      cx += f.x; cz += f.z;
+      if (l.side > 0) { lx += f.x; lz += f.z; ln++; } else { rx += f.x; rz += f.z; rn++; }
+      if (l.hipZ > this._meanHipZ + 1e-6) { fx += f.x; fz += f.z; fn++; }
+      else if (l.hipZ < this._meanHipZ - 1e-6) { bx += f.x; bz += f.z; bn++; }
+    }
+    cx /= n; cz /= n;
+
+    // Which way do the feet say the body faces? (Two clues: sideways line and front-to-back line)
+    let dx = 0, dz = 0;
+    if (ln && rn) {                                      // left feet minus right feet points to the body's left; turn that into "forward"
+      const vx = lx / ln - rx / rn, vz = lz / ln - rz / rn;
+      dx += -vz; dz += vx;
+    }
+    if (fn && bn) { dx += fx / fn - bx / bn; dz += fz / fn - bz / bn; }
+    let feetYaw = this.goalYaw;
+    if (dx * dx + dz * dz > 1e-6) feetYaw = Math.atan2(dx, dz);
+
+    // Mostly trust the feet. (With only two legs the feet swing a lot with each step, so trust them a bit less.)
+    const trust = this._gait.m > 1 ? 0.7 : 0.5;
+    const targetYaw = this.yaw + wrapAngle(feetYaw - this.yaw) * trust + wrapAngle(this.goalYaw - this.yaw) * (1 - trust);
+    // Ease toward it. Feet jump a little with every step, so we smooth that out: the body
+    // follows the feet's overall direction, not each individual footfall.
+    // (Easing alone makes the body lag behind the feet by speed / rate, which pushes every foot ahead of its
+    // hip. So we also pass along most of the driver's turning speed, and let the feet correct any difference.)
+    this.yaw += this._yawRate * dt * 0.8 + (targetYaw - this.yaw) * Math.min(1, dt * 4);
+
+    // Where do the feet say the body is? Their middle, minus where the feet rest relative to the body.
+    const s = Math.sin(this.yaw), c = Math.cos(this.yaw);
+    const tx = cx - (this._restC.x * c + this._restC.z * s);
+    const tz = cz - (-this._restC.x * s + this._restC.z * c);
+    const k = Math.min(1, dt * 5);
+    this.pos.x += Math.sin(this.goalYaw) * this.speed * dt + (tx - this.pos.x) * k;   // keep up with the driver's speed, feet correct the rest
+    this.pos.z += Math.cos(this.goalYaw) * this.speed * dt + (tz - this.pos.z) * k;
+  }
+
+  // ---- BODY SEGMENTS ---------------------------------------------------
+  // Segments with legs on them are RIGID: they move with the body. The others (a head, an
+  // abdomen, a tail) are LOOSE: each one hangs from its neighbor on a hinge, and swings on a
+  // spring. They trail behind when the body turns, bob when it rises and falls, and wag a
+  // little with the gait clock.
+  _setupParts() {
+    const parts = this.parts;
+    for (const l of this.legs) parts[l.part].rigid = true;
+    this.bodyH = Math.max(...parts.filter(p => p.rigid).map(p => p.height));
+    parts.forEach((p, i) => {
+      if (p.rigid) { p.parent = -1; p.depth = -1; return; }
+      let nearest = -1, nearestDist = Infinity;                     // the closest rigid segment
+      parts.forEach((q, j) => { if (q.rigid && Math.abs(i - j) < nearestDist) { nearestDist = Math.abs(i - j); nearest = j; } });
+      p.parent = i + Math.sign(nearest - i);                        // the neighbor on the way toward it
+      p.depth = nearestDist - 1;                                    // how many loose segments lie in between
+      p.dir = Math.sign(i - nearest);                               // +1 in front of the body, -1 behind it
+    });
+    // The hinge sits where a loose segment overlaps its parent
+    for (const p of parts) {
+      if (p.rigid) continue;
+      const par = parts[p.parent];
+      const parentEdge = p.dir < 0 ? par.zc - par.length / 2 : par.zc + par.length / 2;
+      const myEdge = p.dir < 0 ? p.zc + p.length / 2 : p.zc - p.length / 2;
+      p.pivot = new THREE.Vector3(0, (p.y + par.y) / 2, (parentEdge + myEdge) / 2);
+    }
+    this._partOrder = parts.map((p, i) => i).sort((a, b) => parts[a].depth - parts[b].depth);   // parents before children
+    this._lastYaw = this.yaw;
+  }
+
+  _updateParts(dt) {
+    const parts = this.parts, flex = this.gait.flex;
+    const step = Math.max(dt, 1e-4);
+    const yawRate = wrapAngle(this.yaw - this._lastYaw) / step;     // how fast the body is turning
+    const vy = (this.bodyY - this._lastBodyY) / step;               // how fast it is rising or falling
+    this._lastYaw = this.yaw;
+    this._lastBodyY = this.bodyY;
+    const speedFrac = Math.min(1, Math.abs(this.speed) / this.maxSpeed);
+    const wag = Math.PI * 2 * this.clock;
+
+    for (const i of this._partOrder) {
+      const p = parts[i];
+      if (p.rigid) {
+        p.mRel.identity();
+      } else {
+        // Where this segment "wants" to point. Rear segments trail outside a turn, front ones look into it.
+        const turn = (p.dir < 0 ? 1 : 0.5) * yawRate * 0.25 * (1 + 0.4 * p.depth);
+        const sway = -p.dir * Math.sin(wag + p.depth * 0.8) * 0.14 * speedFrac * (1 + 0.3 * p.depth);
+        const yawGoal = Math.max(-0.6, Math.min(0.6, (turn + sway) * flex));
+        const pitchGoal = Math.max(-0.35, Math.min(0.35, p.dir * vy * 0.1 * flex));   // lag behind up and down motion
+        // A spring pulls it toward that angle, with some damping so it settles
+        p.yawV += (60 * (yawGoal - p.yaw) - 10 * p.yawV) * dt;
+        p.yaw += p.yawV * dt;
+        p.pitchV += (60 * (pitchGoal - p.pitch) - 10 * p.pitchV) * dt;
+        p.pitch += p.pitchV * dt;
+        // Swing it about the hinge: move the hinge to the origin, rotate, move it back, then follow the parent
+        this._euler.set(p.pitch, p.yaw, 0, 'YXZ');
+        this._qa.setFromEuler(this._euler);
+        this._m1.makeTranslation(p.pivot.x, p.pivot.y, p.pivot.z);
+        this._m2.makeRotationFromQuaternion(this._qa);
+        this._m1.multiply(this._m2);
+        this._m2.makeTranslation(-p.pivot.x, -p.pivot.y, -p.pivot.z);
+        this._m1.multiply(this._m2);
+        p.mRel.multiplyMatrices(parts[p.parent].mRel, this._m1);
+      }
+      p.mesh.matrix.multiplyMatrices(p.mRel, p.mLocal);
+      p.mesh.matrixWorldNeedsUpdate = true;
+    }
   }
 
   // ---- BODY TILT -------------------------------------------------------
@@ -648,13 +834,144 @@ class Creature {
     this.tiltB += (B - this.tiltB) * k;
 
     // Lean into turns, like a bike
-    const bankTarget = -Math.max(-1, Math.min(1, this.turn)) * (this.speed / this.maxSpeed) * 0.15;
+    // Weight shift: when the feet on one side lift, the body leans toward the side still standing
+    let leftDown = 0, leftN = 0, rightDown = 0, rightN = 0;
+    for (const l of legs) {
+      if (l.side > 0) { leftN++; if (!l.stepping) leftDown++; }
+      else { rightN++; if (!l.stepping) rightDown++; }
+    }
+    const sway = (rightN ? rightDown / rightN : 0.5) - (leftN ? leftDown / leftN : 0.5);   // +1 when only the right feet are down
+    const gaitAmount = Math.min(1, Math.abs(this.speed) / this.maxSpeed * 3);
+    const bankTarget = -Math.max(-1, Math.min(1, this._yawRate / 1.6)) * (this.speed / this.maxSpeed) * 0.15 + 0.06 * sway * gaitAmount;
     this.bank += (bankTarget - this.bank) * Math.min(1, dt * 4);
 
     T.n.set(-this.tiltA, 1, -this.tiltB).normalize();  // which way is "up" for the tilted body
     this._qTilt.setFromUnitVectors(UP, T.n);
     this._qBank.setFromAxisAngle(AXIS_Z, this.bank);
     this.q.setFromAxisAngle(UP, this.yaw).multiply(this._qTilt).multiply(this._qBank);
+  }
+
+  // ---- GAIT ------------------------------------------------------------
+  // A gait is WHEN each foot swings. Real animals use a few patterns, and they
+  // are all the same recipe with different numbers:
+  //   - A gait clock ticks around from 0 to 1. Each leg has an offset, so it
+  //     swings when the clock reaches its own point in the cycle.
+  //   - Left and right legs are half a cycle apart (they alternate).
+  //   - Down the body, each leg is a bit later than the one behind it, by
+  //     `delta` of a cycle. A small delta gives a slow WAVE ripple (rear to
+  //     front), a delta of 0.5 gives the fast alternating pattern.
+  //   - `sigma` is the fraction of the cycle a foot spends in the air.
+  // Quadruped: walk (legs lift one at a time) then trot (diagonal pairs).
+  // Six legs: wave, then tripod. Eight legs: wave, then alternating tetrapod.
+  // Two legs: walk, then jog. Odd counts work too: just a lopsided wave.
+  // The creature switches from the slow gait to the fast one by itself when
+  // the slow one can no longer keep up.
+  _buildGait() {
+    const legs = this.legs, L = this.avgLeg;
+    const leftCount = legs.filter(l => l.side > 0).length;
+    const m = Math.max(1, leftCount, legs.length - leftCount);   // legs per side
+
+    // Each leg's spot along the body, counted in "rows" from the rear (can be a fraction)
+    const zs = [...new Set(legs.map(l => l.hipZ.toFixed(3)))].map(Number).sort((a, b) => a - b);
+    const gaps = [];
+    for (let i = 1; i < zs.length; i++) gaps.push(zs[i] - zs[i - 1]);
+    gaps.sort((a, b) => a - b);
+    const spacing = gaps.length ? gaps[Math.floor(gaps.length / 2)] : 1;
+    legs.forEach((l, i) => {
+      l.u = (l.hipZ - zs[0]) / spacing;
+      l.jit = (((i * 7) % 5) - 2) * 0.006;           // a tiny difference per leg so it is not perfectly mechanical
+      // Legs packed closely together (like a spider's) alternate reaching near and far, so
+      // neighbors can swing past each other without their feet colliding.
+      l.reachMul = spacing < 0.35 * L ? (Math.round(l.u) % 2 === 0 ? 0.72 : 1.28) : 1;
+    });
+
+    const slowDelta = 1 / (2 * m);
+    // A lopsided body (different number of legs on each side) can't alternate in clean pairs,
+    // so its "fast" gait is a quicker wave instead of a trot.
+    const symmetric = leftCount === legs.length - leftCount;
+    const fastDelta = symmetric ? 0.5 : Math.max(slowDelta, 1 / m);
+    const gi = this._gait = {
+      m, symmetric,
+      deltaSlow: slowDelta, sigmaSlow: Math.min(slowDelta, 0.4),
+      deltaFast: fastDelta, sigmaFast: symmetric ? (m === 1 ? 0.46 : 0.5) : Math.min(fastDelta, 0.4),
+      swing: Math.max(0.18, Math.min(0.5, 0.26 * Math.pow(L, 0.4))),   // seconds a foot is in the air (bigger legs, slower swings)
+    };
+    // The fastest each gait can go: the body travels while a foot is planted, and that
+    // distance must stay within what the leg can reach (about half a leg length).
+    // Legs packed close together also limit speed: a foot should not travel much farther than the gap to its neighbor.
+    this._capOf = (sigma, swing) => Math.min(
+      0.5 * L * sigma / ((1 - sigma) * swing),
+      m > 1 ? 0.9 * spacing * sigma / ((1 - sigma) * swing) : Infinity);
+    gi.capSlow = this._capOf(gi.sigmaSlow, gi.swing);
+    gi.capFast = this._capOf(gi.sigmaFast, gi.swing * 0.75);
+    this.maxSpeed = Math.min(L * 1.1 * this.gait.speed, 0.9 * gi.capFast);
+    this._turnRadius = legs.reduce((a, l) => a + Math.abs(l.hipX) + l.length * 0.45, 0) / legs.length;
+
+    // Where the feet rest on average, in the body's own frame. The body hangs around that point.
+    let sumX = 0, sumZ = 0;
+    for (const l of legs) { sumX += l.hipX + l.side * l.length * 0.45 * l.reachMul; sumZ += l.hipZ; }
+    this._restC = { x: sumX / legs.length, z: sumZ / legs.length };
+    this._meanHipZ = sumZ / legs.length;
+
+    this.gaitFast = false;
+    this.delta = gi.deltaSlow;
+    this.sigma = gi.sigmaSlow;
+    this.clock = 0;
+    this._tCyc = gi.swing / this.sigma;
+    this._speedLimit = Infinity;
+    this._moving = false;
+    this.stats = { scheduled: 0, emergency: 0, tidy: 0 };   // how often each kind of step happened (for testing)
+    for (const l of legs) {
+      const offset = (l.side < 0 ? 0.5 : 0) + this.delta * l.u + l.jit;
+      l.phase = ((-offset % 1) + 1) % 1;
+      l.armed = false;                               // armed = "the clock says it is time to swing"
+      l.armedTime = 0;
+    }
+  }
+
+  gaitName() {
+    if (!this._moving) return 'Standing';
+    const m = this._gait.m, fast = this.gaitFast;
+    if (!this._gait.symmetric) return fast ? 'Quick wave (lopsided)' : 'Wave (lopsided)';
+    if (m === 1) return fast ? 'Jog' : 'Walk';
+    if (m === 2) return fast ? 'Trot (diagonal pairs)' : 'Walk (one leg at a time)';
+    if (m === 3) return fast ? 'Tripod' : 'Wave (ripple)';
+    if (m === 4) return fast ? 'Alternating tetrapod' : 'Wave (ripple)';
+    return fast ? 'Alternating gait' : 'Wave (ripple)';
+  }
+
+  // Tick the gait clock and arm each leg when its turn comes
+  _updateGait(dt, vEff, moving) {
+    const gi = this._gait;
+    this._moving = moving;
+
+    // Slow gait or fast gait? Switch when the slow one can no longer keep up (with a gap so it doesn't flicker)
+    if (!this.gaitFast && vEff > 0.85 * gi.capSlow) this.gaitFast = true;
+    else if (this.gaitFast && vEff < 0.6 * gi.capSlow) this.gaitFast = false;
+    const k = Math.min(1, dt * 1.5);                   // blend between gaits over about a second
+    this.delta += ((this.gaitFast ? gi.deltaFast : gi.deltaSlow) - this.delta) * k;
+    this.sigma += ((this.gaitFast ? gi.sigmaFast : gi.sigmaSlow) - this.sigma) * k;
+
+    // How long one full cycle takes. Faster walking means quicker swings and more steps per second.
+    const swing = gi.swing * (1 - 0.25 * Math.min(1, vEff / this.maxSpeed));
+    const cap = this._capOf(this.sigma, swing);
+    const cadence = Math.max(0.35, Math.min(1, vEff / (0.8 * cap)));   // slow walkers step less often, so strides don't shrink to nothing
+    this._tCyc = swing / this.sigma / cadence;
+    this._speedLimit = 0.95 * cap;                     // the creature can't outrun the gait it is using (it speeds up as the faster gait takes over)
+
+    const dClock = moving ? dt / this._tCyc : 0;       // standing still: the clock stops
+    this.clock = (this.clock + dClock) % 1;
+    for (const l of this.legs) {
+      const offset = (l.side < 0 ? 0.5 : 0) + this.delta * l.u + l.jit;
+      if (dClock > 0 && !l.stepping) {                 // ease the leg toward its place in the pattern
+        let d = (this.clock - offset) - l.phase;
+        d -= Math.round(d);
+        l.phase += Math.max(-0.3 * dt, Math.min(0.3 * dt, d));
+      }
+      l.phase += dClock;
+      if (l.phase >= 1) { l.phase -= 1; l.armed = true; l.armedTime = 0; }
+      else if (l.phase < 0) l.phase += 1;
+    }
   }
 
   // ---- STEPPING --------------------------------------------------------
@@ -670,7 +987,7 @@ class Creature {
   _chooseLanding(l, fx, fz, fyaw, lead, out) {
     const w = this.world, L = l.length, T = this._tmp;
     const s = Math.sin(fyaw), c = Math.cos(fyaw);
-    const lx0 = l.hipX + l.side * L * 0.45, lz0 = l.hipZ + lead;     // the ideal spot, in the body's frame
+    const lx0 = l.hipX + l.side * L * 0.45 * l.reachMul, lz0 = l.hipZ + lead;     // the ideal spot, in the body's frame
 
     // Where the other feet are (or will land), in that same frame
     const others = [];
@@ -683,7 +1000,7 @@ class Creature {
 
     // Where the hip will be when the foot lands (the body keeps moving while the foot swings)
     this._hipWorld(l, T.hip);
-    const hipX = T.hip.x + (fx - this.pos.x), hipY = T.hip.y, hipZ = T.hip.z + (fz - this.pos.z);
+    const hipX = T.hip.x + (fx - this.goalPos.x), hipY = T.hip.y, hipZ = T.hip.z + (fz - this.goalPos.z);
 
     const restY = w.groundHeight(fx + lx0 * c + lz0 * s, fz - lx0 * s + lz0 * c);
     const step = L * 0.12, e = 0.3;
@@ -703,6 +1020,7 @@ class Creature {
         cost += Math.min(slope, 2) * 0.5;                              // prefer flatter ground
         if (drop > 0.35) cost += 1.5 + drop * 0.5;                     // avoid cliffs and box edges
         cost += Math.abs(y - restY) * 0.4;                             // prefer the same height as the ideal spot
+        if (y > w.groundHeight(x, z, this.climbHeight) + 0.01) cost += 8;   // never land on a box too tall to climb
 
         const reach = Math.hypot(hipX - x, hipY - (y + l.footSize * 0.45), hipZ - z) / L;
         if (reach > 0.92) cost += (reach - 0.92) * 10;                 // avoid spots at the edge of reach
@@ -714,8 +1032,8 @@ class Creature {
           const sep = (l.footSize + o.footSize) * 1.4;
           const d = Math.hypot(lx - olx, lz - olz);
           if (d < sep) cost += (sep - d) * 8;                          // do not stand on another foot
-          if (o.side === l.side && o.hipZ !== l.hipZ) {                // keep the order of legs along the body
-            const gap = Math.min(sep, Math.abs(o.hipZ - l.hipZ) * 0.7);
+          if (o.side === l.side && o.hipZ !== l.hipZ && Math.abs(lx - olx) < sep) {                // keep the order of legs along the body
+            const gap = Math.min(sep * 0.7, Math.abs(o.hipZ - l.hipZ) * 0.4);
             if (o.hipZ > l.hipZ && lz > olz - gap) cost += (lz - (olz - gap)) * 12;
             if (o.hipZ < l.hipZ && lz < olz + gap) cost += ((olz + gap) - lz) * 12;
           }
@@ -726,19 +1044,22 @@ class Creature {
     return out;
   }
 
-  _startStep(l) {
+  _startStep(l, moving) {
     const g = this.gait, T = this._tmp;
-    const speedFrac = Math.min(1, Math.abs(this.speed) / this.maxSpeed);
-    const t0 = g.stepTime * (1 - 0.3 * speedFrac);     // faster walking, quicker steps
+    // How long the swing takes: the gait clock decides (a standing creature just takes a normal step)
+    const t0 = moving ? this.sigma * this._tCyc : this._gait.swing;
 
     // Pick the landing spot ONCE, for where the body will be when the foot lands.
     // (Aiming at a moving target every frame is what made feet jump around.)
-    const futureYaw = this.yaw + this.turn * 1.6 * t0;
-    const futureX = this.pos.x + Math.sin(this.yaw) * this.speed * t0;
-    const futureZ = this.pos.z + Math.cos(this.yaw) * this.speed * t0;
+    const futureYaw = this.goalYaw + this._yawRate * t0;
+    const futureX = this.goalPos.x + Math.sin(this.goalYaw) * this.speed * t0;
+    const futureZ = this.goalPos.z + Math.cos(this.goalYaw) * this.speed * t0;
     // Land a little AHEAD of the resting spot: as the body walks past, the foot ends up as far
     // behind as it started ahead, so the legs stay centered under the body instead of trailing.
-    const lead = Math.sign(this.speed) * speedFrac * l.length * g.trigger * 0.9;
+    // While this foot is planted the body travels some distance. Land a bit ahead by half of it,
+    // so the foot ends up as far behind the middle as it started ahead.
+    const stanceTravel = Math.abs(this.speed) * (1 - this.sigma) * this._tCyc;
+    const lead = moving ? Math.sign(this.speed) * Math.min(0.3 * l.length, stanceTravel * 0.5) : 0;
     this._chooseLanding(l, futureX, futureZ, futureYaw, lead, l.to);
     l.from.copy(l.pos);
 
@@ -765,22 +1086,41 @@ class Creature {
   update(dt) {
     const g = this.gait, T = this._tmp, legs = this.legs;
 
-    // 1. Move the whole creature using what the controller asked for
-    // If the feet are falling behind (hard ground), ease off like an animal picking its way
-    const paceTarget = this._strain > 1.15 ? Math.max(0.3, 1.15 / this._strain) : 1;
-    this.pace += (paceTarget - this.pace) * Math.min(1, dt * 6);
-    this.speed += (this.fwd * this.maxSpeed * this.pace - this.speed) * Math.min(1, dt * 4);
-    this.yaw += this.turn * 1.6 * dt;
-    this.pos.x += Math.sin(this.yaw) * this.speed * dt;
-    this.pos.z += Math.cos(this.yaw) * this.speed * dt;
-    const idle = Math.abs(this.speed) < 0.05 && Math.abs(this.turn) < 0.05;
+    // 1. Move the DRIVER (the invisible intent pose) using what the controller asked for.
+    //    It waits for the body, like a dog on a leash: if the body is too far behind it, or
+    //    facing too far away from it, the driver slows down or stops turning.
+    const L = this.avgLeg;
+    // How far is the body behind (or off to the side of) the driver? Being AHEAD of it is fine.
+    const gdx = this.goalPos.x - this.pos.x, gdz = this.goalPos.z - this.pos.z;
+    const behind = gdx * Math.sin(this.goalYaw) + gdz * Math.cos(this.goalYaw);
+    const aside = gdx * Math.cos(this.goalYaw) - gdz * Math.sin(this.goalYaw);
+    const dist = Math.hypot(Math.max(0, behind), aside);
+    const yawErr = Math.abs(wrapAngle(this.goalYaw - this.yaw));
+    const leashPos = clamp01(1 - (dist - 0.3 * L) / (0.5 * L));          // some slack, then slow down
+    const leashYaw = clamp01(1 - (yawErr - 0.35) / 0.6);                 // about 20 degrees of slack, then slow the turn
+    const strainPace = this._strain > 1.15 ? Math.max(0.3, 1.15 / this._strain) : 1;   // hard ground: ease off
+    const paceTarget = Math.min(strainPace, leashPos, 0.3 + 0.7 * leashYaw);
+    this.pace += (paceTarget - this.pace) * Math.min(1, dt * 8);
+    const wantSpeed = this.fwd * this.maxSpeed * this.pace;
+    const limitedSpeed = Math.max(-this._speedLimit, Math.min(this._speedLimit, wantSpeed));
+    this.speed += (limitedSpeed - this.speed) * Math.min(1, dt * 4);
+    this._yawRate = this.turn * 1.6 * Math.max(0.12, leashYaw);
+    this.goalYaw += this._yawRate * dt;
+    this.goalPos.x += Math.sin(this.goalYaw) * this.speed * dt;
+    this.goalPos.z += Math.cos(this.goalYaw) * this.speed * dt;
 
-    // 2. Lean the body to match the ground under the feet
+    // 2. Place the visible body from the feet, then lean it to match the ground
+    this._followFeet(dt);
     this._updateOrientation(dt);
+    this._updateParts(dt);
 
-    // 3. Decide which planted feet should start a step.
-    //    A foot steps when it lags behind its resting spot, or when its leg is
-    //    stretched too far. When standing still, feet tidy themselves up.
+    // 3. The gait clock decides when each foot should swing. On top of that, a foot
+    //    steps early if its leg is over-stretched, and when standing still the
+    //    feet tidy themselves into a neat stance.
+    const vEff = Math.abs(this.speed) + Math.abs(this._yawRate) * this._turnRadius * 0.6;   // turning counts as moving
+    const moving = vEff > 0.05;
+    this._updateGait(dt, vEff, moving);
+
     let lifted = 0;
     for (const l of legs) if (l.stepping) lifted++;
     const maxLifted = Math.max(1, Math.floor(legs.length / 2));     // at least half the feet stay down
@@ -789,24 +1129,26 @@ class Creature {
     let strain = 0;
     for (const l of legs) {
       if (l.stepping) continue;
-      this._restFoot(l, this.pos.x, this.pos.z, this.yaw, 0, T.ideal);
+      this._restFoot(l, this.goalPos.x, this.goalPos.z, this.goalYaw, 0, T.ideal);
       const lag = Math.hypot(T.ideal.x - l.pos.x, T.ideal.z - l.pos.z);
       this._hipWorld(l, T.hip);
       const stretch = Math.hypot(T.hip.x - l.pos.x, T.hip.y - (l.pos.y + l.footSize * 0.45), T.hip.z - l.pos.z) / l.length;
-      const trigger = idle ? g.trigger * 0.5 : g.trigger;
-      const urgency = Math.max(lag / (l.length * trigger), (stretch - 0.72) / 0.22);
-      strain = Math.max(strain, urgency);
-      if (urgency > 1) wants.push({ l, urgency, stretch });
+      strain = Math.max(strain, lag / (l.length * 0.45), (stretch - 0.72) / 0.22);
+      if (stretch > 1.0 || lag > 0.6 * l.length) wants.push({ l, urgency: 100 + stretch, emergency: true });
+      else if (l.armed && moving) { l.armedTime += dt; wants.push({ l, urgency: 10 + l.armedTime, emergency: false }); }
+      else if (!moving && lag > 0.12 * l.length) wants.push({ l, urgency: lag / l.length, emergency: false });
     }
     this._strain = strain;                             // how far behind the feet are (used to set the pace)
-    wants.sort((a, b) => b.urgency - a.urgency);       // the most overdue foot goes first
+    wants.sort((a, b) => b.urgency - a.urgency);
     for (const w of wants) {
-      const emergency = w.stretch > 1.0;               // the leg is stretched past its reach
-      if (lifted >= (emergency ? emergencyMax : maxLifted)) continue;
-      if (!emergency && w.l.neighbors.some(n => n.stepping)) continue;   // the gait rule
-      this._startStep(w.l);
+      if (lifted >= (w.emergency ? emergencyMax : maxLifted)) continue;
+      if (!w.emergency && w.l.neighbors.some(n => n.stepping && n.t < 0.75)) continue;   // don't lift beside a neighbor that has only just lifted
+      if (w.emergency) this.stats.emergency++; else if (moving) this.stats.scheduled++; else this.stats.tidy++;
+      this._startStep(w.l, moving);
+      w.l.armed = false;
       lifted++;
     }
+    if (!moving) for (const l of legs) l.armed = false;
 
     // 4. Move the feet
     for (const l of legs) {
@@ -845,14 +1187,18 @@ class Creature {
 
     // 5b. Keep the body out of the ground: check the ground under and just
     //     ahead of the (tilted) body, and make sure its curved underside clears it.
-    const halfW = this.spec.body.width / 2, halfL = this.spec.body.length / 2, halfH = this.spec.body.height / 2;
     let hardFloor = -Infinity, softFloor = -Infinity;
-    for (const [nx, nz, depth, hard, extra] of BODY_SAMPLES) {
-      T.p.set(nx * (halfW + extra), -halfH * depth, nz * (halfL + extra)).applyQuaternion(this.q);   // that spot on the body's underside
-      const ground = this.world.groundHeight(this.pos.x + T.p.x, this.pos.z + T.p.z, this.climbHeight);
-      const need = ground + 0.1 - T.p.y;                // how high the body center must be
-      if (hard) hardFloor = Math.max(hardFloor, need);
-      else softFloor = Math.max(softFloor, need);
+    for (const part of this.parts) {                     // every segment of the body must clear the ground
+      const halfW = part.width / 2, halfL = part.length / 2, halfH = part.height / 2;
+      for (const [nx, nz, depth, hard, extra] of BODY_SAMPLES) {
+        // that spot on the segment's underside, then follow the segment's swing and the body's tilt
+        T.p.set(nx * (halfW + extra), part.y - halfH * depth, part.zc + nz * (halfL + extra))
+          .applyMatrix4(part.mRel).applyQuaternion(this.q);
+        const ground = this.world.groundHeight(this.pos.x + T.p.x, this.pos.z + T.p.z, this.climbHeight);
+        const need = ground + 0.1 - T.p.y;              // how high the body center must be
+        if (hard) hardFloor = Math.max(hardFloor, need);
+        else softFloor = Math.max(softFloor, need);
+      }
     }
     targetY = Math.max(targetY, softFloor, hardFloor);
     const rate = targetY > this.bodyY ? 12 : 7;         // rise quickly, settle gently
@@ -860,9 +1206,9 @@ class Creature {
     this.bodyY = Math.max(this.bodyY, hardFloor);       // never sink into the ground
 
     // 6. Place the shapes
-    this.bodyMesh.position.set(this.pos.x, this.bodyY, this.pos.z);
-    this.bodyMesh.quaternion.copy(this.q);
-    for (const l of legs) this._solveLegIK(l);
+    this.bodyGroup.position.set(this.pos.x, this.bodyY, this.pos.z);
+    this.bodyGroup.quaternion.copy(this.q);
+    for (const l of legs) this._solveLegIK(l, dt);
     this._separateLegs();
     for (const l of legs) this._placeLeg(l, dt);
   }
@@ -870,7 +1216,7 @@ class Creature {
   // Two-bone leg IK: the hip is on the body, the foot is on the ground, and
   // the leg has two equal bones. The knee sits halfway between them, pushed
   // out sideways by an amount we get from Pythagoras. Saves the three joints.
-  _solveLegIK(l) {
+  _solveLegIK(l, dt) {
     const { hip, end, dir, pole, knee, v } = this._tmp;
 
     this._hipWorld(l, hip);
@@ -891,6 +1237,10 @@ class Creature {
     // Knees bend up and a little outward (relative to the tilted body), like a spider
     pole.set(l.side * 0.6, 1, 0).applyQuaternion(this.q);
     pole.addScaledVector(dir, -pole.dot(dir)).normalize();
+    l.poleS.lerp(pole, Math.min(1, dt * 20));        // ease the knee direction so it never flicks suddenly
+    l.poleS.addScaledVector(dir, -l.poleS.dot(dir));
+    if (l.poleS.lengthSq() < 1e-6) l.poleS.copy(pole);
+    pole.copy(l.poleS).normalize();
 
     const half = l.length / 2;
     const a = dist / 2;
@@ -973,26 +1323,52 @@ class Creature {
 
   dispose() {
     scene.remove(this.root);
-    this.bodyMat.dispose();
+    for (const m of this.bodyMats) m.dispose();
   }
 }
 
 // ---- A quick way to make specs from a few numbers --------------------
 // Legs come in left/right pairs spread along the body. An odd number of legs
 // just leaves the last pair with one leg, which makes a lopsided creature.
+// How a body of 1 to 4 segments is shaped, from front to rear. len is each segment's share of the
+// length, w and h are its width and height compared with the biggest segment, and legs says where
+// the legs grow. (Like an insect: head, thorax with the legs, abdomen.)
+const BODY_PATTERNS = {
+  1: [{ len: 1, w: 1, h: 1, legs: true }],
+  2: [{ len: 0.62, w: 0.8, h: 0.85, legs: true }, { len: 0.38, w: 1, h: 1 }],
+  3: [{ len: 0.16, w: 0.55, h: 0.6 }, { len: 0.54, w: 0.85, h: 0.85, legs: true }, { len: 0.3, w: 1, h: 1 }],
+  4: [{ len: 0.14, w: 0.5, h: 0.55 }, { len: 0.3, w: 0.8, h: 0.8, legs: true }, { len: 0.3, w: 0.85, h: 0.85, legs: true }, { len: 0.26, w: 1, h: 1 }],
+};
+
 function specFromParams(p) {
+  // The body: scale the pattern to the requested length (segments overlap a little, so allow for that)
+  const pattern = BODY_PATTERNS[p.bodySegments] || BODY_PATTERNS[1];
+  let overlaps = 0;
+  for (let i = 1; i < pattern.length; i++) overlaps += 0.4 * Math.min(pattern[i - 1].len, pattern[i].len);
+  const scale = p.bodyLength / (pattern.reduce((s, q) => s + q.len, 0) - overlaps);
+  const mix = (v) => 1 + (v - 1) * p.segmentContrast;              // contrast 0 = all segments the same size
+  const segments = pattern.map(q => ({
+    length: q.len * scale, width: p.bodyWidth * mix(q.w), height: p.bodyHeight * mix(q.h), legs: !!q.legs }));
+  const layout = layoutBodyParts({ segments });
+
+  // The legs are spread along the segments that carry them
+  const carriers = layout.parts.filter(q => q.legs);
+  const zMax = Math.max(...carriers.map(q => q.zc + q.length / 2));
+  const zMin = Math.min(...carriers.map(q => q.zc - q.length / 2));
+  const zoneMid = (zMax + zMin) / 2, zoneHalf = (zMax - zMin) / 2;
+
   const rows = Math.ceil(p.legs / 2);
   const legs = [];
   for (let i = 0; i < p.legs; i++) {
     const side = (i % 2 === 0) ? 1 : -1;
     const row = Math.floor(i / 2);
-    const z = (rows === 1) ? 0 : p.bodyLength * 0.4 * (1 - 2 * row / (rows - 1));
+    const z = (rows === 1) ? zoneMid : zoneMid + zoneHalf * 0.8 * (1 - 2 * row / (rows - 1));
     legs.push({ hipX: side, hipZ: z, length: p.legLength, thickness: p.thickness, footSize: p.footSize });
   }
   return {
-    body: { length: p.bodyLength, width: p.bodyWidth, height: p.bodyHeight },
+    body: { length: layout.length, width: p.bodyWidth, height: p.bodyHeight, segments },
     legs,
-    gait: { stepHeight: p.stepHeight, tilt: p.tilt, speed: p.speed },
+    gait: { stepHeight: p.stepHeight, tilt: p.tilt, speed: p.speed, flex: p.bodyFlex },
   };
 }
 
@@ -1012,15 +1388,15 @@ function pickWaypoint(c) {
 
 function steerWander(c, dt) {
   wander.timer -= dt;
-  let dx = wander.x - c.pos.x, dz = wander.z - c.pos.z;
-  if (Math.hypot(dx, dz) < 1.5 || wander.timer <= 0) { pickWaypoint(c); dx = wander.x - c.pos.x; dz = wander.z - c.pos.z; }
+  let dx = wander.x - c.goalPos.x, dz = wander.z - c.goalPos.z;
+  if (Math.hypot(dx, dz) < 1.5 || wander.timer <= 0) { pickWaypoint(c); dx = wander.x - c.goalPos.x; dz = wander.z - c.goalPos.z; }
 
   // Head for the target, but get nudged away from boxes it can't climb and from the edge
   const dist = Math.hypot(dx, dz) || 1;
   let dirX = dx / dist, dirZ = dz / dist;
   for (const b of boxes) {
     if (b.height <= c.climbHeight) continue;
-    const bx = c.pos.x - b.x, bz = c.pos.z - b.z;
+    const bx = c.goalPos.x - b.x, bz = c.goalPos.z - b.z;
     const d = Math.hypot(bx, bz) || 0.01;
     const range = b.half * 1.5 + c.radius + 2.5;
     if (d < range) {
@@ -1030,10 +1406,10 @@ function steerWander(c, dt) {
     }
   }
   const edge = LIMIT - 4;
-  if (Math.abs(c.pos.x) > edge) dirX -= Math.sign(c.pos.x) * 1.5;
-  if (Math.abs(c.pos.z) > edge) dirZ -= Math.sign(c.pos.z) * 1.5;
+  if (Math.abs(c.goalPos.x) > edge) dirX -= Math.sign(c.goalPos.x) * 1.5;
+  if (Math.abs(c.goalPos.z) > edge) dirZ -= Math.sign(c.goalPos.z) * 1.5;
 
-  let diff = Math.atan2(dirX, dirZ) - c.yaw;       // how far to turn to face that way
+  let diff = Math.atan2(dirX, dirZ) - c.goalYaw;       // how far to turn to face that way
   diff = Math.atan2(Math.sin(diff), Math.cos(diff));   // wrap into -180..180 degrees
   c.turn = Math.max(-1, Math.min(1, diff * 1.5));
   c.fwd = Math.abs(diff) < 1.0 ? 1 : 0.25;         // slow down for sharp turns
@@ -1044,7 +1420,7 @@ function steerWander(c, dt) {
 function steerByKeys(c) {
   const m = readMoveInput(viewHeading());
   if (m.x === 0 && m.z === 0) { c.fwd = 0; c.turn = 0; return; }
-  let diff = Math.atan2(m.x, m.z) - c.yaw;         // how far to turn to face the wanted direction
+  let diff = Math.atan2(m.x, m.z) - c.goalYaw;         // how far to turn to face the wanted direction
   diff = Math.atan2(Math.sin(diff), Math.cos(diff));
   c.turn = Math.max(-1, Math.min(1, diff * 3));
   c.fwd = Math.abs(diff) < 1.2 ? 1 : 0.15;
@@ -1052,6 +1428,7 @@ function steerByKeys(c) {
 
 // Keep creatures out of boxes and on the floor
 function keepCreatureInWorld(c) {
+  const startX = c.pos.x, startZ = c.pos.z;
   for (const b of boxes) {
     if (b.height <= c.climbHeight) continue;       // low enough to climb, so it is not a wall
     const dx = c.pos.x - b.x, dz = c.pos.z - b.z;
@@ -1064,13 +1441,15 @@ function keepCreatureInWorld(c) {
   const edge = LIMIT - 1;
   c.pos.x = Math.max(-edge, Math.min(edge, c.pos.x));
   c.pos.z = Math.max(-edge, Math.min(edge, c.pos.z));
+  c.goalPos.x += c.pos.x - startX;                 // the driver gets pushed along with the body
+  c.goalPos.z += c.pos.z - startZ;
 }
 
 // =====================================================================
 // PART D: THE CREATURE PANEL (sliders and presets)
 // =====================================================================
 const params = { legs: 4, legLength: 2.0, thickness: 0.12, bodyLength: 2.0, bodyWidth: 1.2, bodyHeight: 0.9, footSize: 0.25,
-                 stepHeight: 0.18, tilt: 0.8, speed: 1 };
+                 stepHeight: 0.18, tilt: 0.8, speed: 1, bodySegments: 1, segmentContrast: 0.7, bodyFlex: 0.6 };
 
 // [setting, label, min, max, step]
 const sliderDefs = [
@@ -1084,15 +1463,18 @@ const sliderDefs = [
   ['stepHeight', 'Step height',   0.05, 0.4, 0.01],
   ['tilt',       'Body tilt',     0,    1,   0.05],
   ['speed',      'Walk speed',    0.5,  2,   0.1],
+  ['bodySegments',   'Body segments',   1, 4, 1],
+  ['segmentContrast', 'Segment contrast', 0, 1, 0.05],
+  ['bodyFlex',       'Body flex',       0, 1, 0.05],
 ];
 
 const presets = {
-  'Spider (8)':  { legs: 8, legLength: 2.2, thickness: 0.10, bodyLength: 1.6, bodyWidth: 1.4, bodyHeight: 0.8, footSize: 0.20 },
-  'Dog (4)':     { legs: 4, legLength: 1.6, thickness: 0.16, bodyLength: 3.0, bodyWidth: 1.0, bodyHeight: 1.0, footSize: 0.25 },
-  'Beetle (6)':  { legs: 6, legLength: 1.4, thickness: 0.10, bodyLength: 2.4, bodyWidth: 1.2, bodyHeight: 0.7, footSize: 0.20 },
-  'Bird (2)':    { legs: 2, legLength: 2.4, thickness: 0.14, bodyLength: 1.2, bodyWidth: 1.2, bodyHeight: 1.4, footSize: 0.35 },
-  'Oddball (5)': { legs: 5, legLength: 2.0, thickness: 0.12, bodyLength: 2.8, bodyWidth: 1.6, bodyHeight: 1.0, footSize: 0.25 },
-  'Stilts (4)':  { legs: 4, legLength: 3.5, thickness: 0.20, bodyLength: 2.6, bodyWidth: 1.2, bodyHeight: 1.2, footSize: 0.40 },
+  'Spider (8)':  { legs: 8, legLength: 2.2, thickness: 0.10, bodyLength: 2.6, bodyWidth: 1.4, bodyHeight: 0.8, footSize: 0.20, bodySegments: 2, segmentContrast: 0.8, bodyFlex: 0.7 },
+  'Dog (4)':     { legs: 4, legLength: 1.6, thickness: 0.16, bodyLength: 3.0, bodyWidth: 1.0, bodyHeight: 1.0, footSize: 0.25, bodySegments: 1, segmentContrast: 0.7, bodyFlex: 0.6 },
+  'Beetle (6)':  { legs: 6, legLength: 1.4, thickness: 0.10, bodyLength: 3.2, bodyWidth: 1.2, bodyHeight: 0.7, footSize: 0.20, bodySegments: 3, segmentContrast: 0.7, bodyFlex: 0.5 },
+  'Bird (2)':    { legs: 2, legLength: 2.4, thickness: 0.14, bodyLength: 1.2, bodyWidth: 1.2, bodyHeight: 1.4, footSize: 0.35, bodySegments: 1, segmentContrast: 0.7, bodyFlex: 0.6 },
+  'Oddball (5)': { legs: 5, legLength: 2.0, thickness: 0.12, bodyLength: 3.4, bodyWidth: 1.6, bodyHeight: 1.0, footSize: 0.25, bodySegments: 3, segmentContrast: 0.6, bodyFlex: 0.6 },
+  'Stilts (4)':  { legs: 4, legLength: 3.5, thickness: 0.20, bodyLength: 2.6, bodyWidth: 1.2, bodyHeight: 1.2, footSize: 0.40, bodySegments: 1, segmentContrast: 0.7, bodyFlex: 0.6 },
 };
 
 let creature = null;
@@ -1163,6 +1545,8 @@ document.getElementById('wander').addEventListener('change', e => e.target.blur(
 // PART E: THE MAIN LOOP
 // =====================================================================
 const clock = new THREE.Clock();
+const gaitEl = document.getElementById('gaitInfo');
+let lastGaitText = '';
 
 function animate() {
   requestAnimationFrame(animate);
@@ -1175,6 +1559,8 @@ function animate() {
   else { creature.fwd = 0; creature.turn = 0; }
   creature.update(dt);
   keepCreatureInWorld(creature);
+  const gaitText = 'Gait: ' + creature.gaitName();
+  if (gaitText !== lastGaitText) { gaitEl.textContent = gaitText; lastGaitText = gaitText; }
 
   placeCamera(dt);
   renderer.render(scene, camera);
