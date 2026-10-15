@@ -120,6 +120,25 @@ addBox(-10, 8, 2, 2, 0xf2f2f2);
 // this one function changes the ground for everything.
 let roughness = 1.0;                     // 0 = flat floor, bigger = taller, sharper terrain
 const smooth01 = t => t * t * (3 - 2 * t);
+// An even smoother ease than smooth01: speed AND acceleration are zero at both ends, so a motion
+// that uses it starts and stops with no jolt at all.
+const smoother = k => k * k * k * (k * (6 * k - 15) + 10);
+
+// A critically damped spring. Instead of jumping to a new value, `x` glides toward its target.
+// What makes it smooth is that it has a speed (v) of its own, and the speed changes gradually,
+// so there are no sudden changes of direction or jolts. (Simple easing, like x += (target - x) * k,
+// changes speed instantly whenever the target moves.)
+//   omega: how stiff it is. Bigger = snappier (it settles in roughly 4 / omega seconds).
+//   targetVel: how fast the target itself is moving, so the spring doesn't trail behind it.
+class Spring {
+  constructor(x = 0) { this.x = x; this.v = 0; }
+  update(target, dt, omega, targetVel = 0) {
+    const accel = omega * omega * (target - this.x) + 2 * omega * (targetVel - this.v);
+    this.v += accel * dt;
+    this.x += this.v * dt;
+    return this.x;
+  }
+}
 
 // "Value noise": a random height at every whole-number grid point, blended
 // smoothly in between. Using a hash instead of Math.random keeps it the same every time.
@@ -228,7 +247,8 @@ const CAM_NAMES = { first: 'First person', third: 'Third person', observe: 'Obse
 let camMode = 'observe';
 let thirdDist = 5;                       // how far behind you in third person
 let orbitYaw = 0.6, orbitPitch = 0.45, orbitDist = 9;   // observe view settings
-const obsTarget = new THREE.Vector3(-4, 1, 12);         // what the observe camera looks at
+const obsTarget = new THREE.Vector3(-4, 1, 12);
+const camSpring = { x: new Spring(-4), y: new Spring(1), z: new Spring(12) };         // what the observe camera looks at
 const viewBtn = document.getElementById('viewBtn');
 
 function setCamMode(mode) {
@@ -306,6 +326,7 @@ function readMoveInput(heading) {
 
 const SPEED = 5;
 const LIMIT = 24;
+const playerVel = { x: new Spring(0), z: new Spring(0) };   // your horizontal speed, smoothed
 
 function updatePlayer(dt) {
   const heading = viewHeading();
@@ -316,10 +337,13 @@ function updatePlayer(dt) {
   }
 
   // Move one direction at a time, so you slide along walls instead of sticking
-  const newX = Math.max(-LIMIT, Math.min(LIMIT, player.x + moveX * SPEED * dt));
-  if (!blocked(newX, player.z)) player.x = newX;
-  const newZ = Math.max(-LIMIT, Math.min(LIMIT, player.z + moveZ * SPEED * dt));
-  if (!blocked(player.x, newZ)) player.z = newZ;
+  // Your speed is a spring too: it builds up and dies away over a fraction of a second instead of
+  // jumping straight to full speed, so starting and stopping feel smooth.
+  const vx = playerVel.x.update(moveX * SPEED, dt, 14), vz = playerVel.z.update(moveZ * SPEED, dt, 14);
+  const newX = Math.max(-LIMIT, Math.min(LIMIT, player.x + vx * dt));
+  if (!blocked(newX, player.z)) player.x = newX; else { playerVel.x.x = 0; playerVel.x.v = 0; }
+  const newZ = Math.max(-LIMIT, Math.min(LIMIT, player.z + vz * dt));
+  if (!blocked(player.x, newZ)) player.z = newZ; else { playerVel.z.x = 0; playerVel.z.v = 0; }
 
   // Jumping and gravity
   if (keys['Space'] && onGround && !controlCreature) velY = JUMP_SPEED;
@@ -356,7 +380,11 @@ function placeCamera(dt) {
   } else {
     // Orbit the creature. The target glides after it so the camera stays smooth.
     camGoal.set(creature.pos.x, creature.bodyY * 0.7, creature.pos.z);
-    obsTarget.lerp(camGoal, Math.min(1, dt * 6));
+    // Spring the camera target after the creature (the spring knows the creature's speed, so it doesn't trail)
+    obsTarget.set(
+      camSpring.x.update(camGoal.x, dt, 5, Math.sin(creature.goalYaw) * creature.speed),
+      camSpring.y.update(camGoal.y, dt, 5),
+      camSpring.z.update(camGoal.z, dt, 5, Math.cos(creature.goalYaw) * creature.speed));
     const cp = Math.cos(orbitPitch);
     camera.position.set(
       obsTarget.x + Math.sin(orbitYaw) * cp * orbitDist,
@@ -455,6 +483,7 @@ for (const [extra, depth] of [[0.4, 0.9], [0.9, 0.6], [1.5, 0.35]]) {
 }
 
 const AXIS_Z = new THREE.Vector3(0, 0, 1);
+const KNEE_MAX_ACCEL = 400;     // how fast a knee's speed may change (units per second per second)
 
 // A body is a row of ellipsoid segments, listed from the front to the rear (a head, a thorax, an abdomen...).
 // A simple body is just one segment. Each segment is { length, width, height }, plus legs: true if
@@ -526,6 +555,14 @@ class Creature {
     this.goalPos = this.pos.clone();
     this.goalYaw = yaw;
     this._yawRate = 0;                       // how fast the driver is turning right now
+    // Everything that is smoothed is a spring (see Spring above), so it never changes speed suddenly
+    this._sp = new Spring(0);                // forward speed
+    this._yr = new Spring(0);                // turning speed
+    this._pace = new Spring(1);              // how much the driver is holding back for the feet
+    this._px = new Spring(x); this._pz = new Spring(z);   // body position
+    this._yawS = new Spring(yaw);            // body direction
+    this._tA = new Spring(0); this._tB = new Spring(0);   // body tilt (sideways, front to back)
+    this._bk = new Spring(0);                // leaning into turns and weight shift
     this.speed = 0;                          // current forward speed
     this.fwd = 0;                            // what the controller wants: -1 to 1 (back/forward)
     this.turn = 0;                           // what the controller wants: -1 to 1 (right/left)
@@ -586,6 +623,8 @@ class Creature {
       nrm: new THREE.Vector3(0, 1, 0),       // the slope the foot is resting on
       lx: 0, lz: 0,                          // foot position in the body's own frame
       poleS: new THREE.Vector3(0, 1, 0),     // smoothed knee direction (stops the knee flicking around)
+      kneeBase: new THREE.Vector3(), kneeOff: new THREE.Vector3(),   // the knee before the keep-apart pass, and how far that pass moved it (carried to the next frame)
+      kneePrev: new THREE.Vector3(), kneeVel: new THREE.Vector3(), kneeReady: false,   // for limiting how suddenly a knee can speed up
       reachMul: 1,                           // how far out this leg's foot rests (1 = normal)
       hipP: new THREE.Vector3(), kneeP: new THREE.Vector3(), endP: new THREE.Vector3(),   // the leg's three joints this frame
       neighbors: [],
@@ -614,6 +653,7 @@ class Creature {
     }
     this.bodyY = avg / this.legs.length + this.standHeight;
     this._lastBodyY = this.bodyY;
+    this._ys = new Spring(this.bodyY);        // body height
     this.q.setFromAxisAngle(UP, this.yaw);
     this.pace = 1;                           // slows down when the ground is too hard to keep up with
     this._strain = 0;
@@ -635,7 +675,9 @@ class Creature {
     const side = def.hipX >= 0 ? 1 : -1;
     // which segment is this hip on? the one whose middle is closest (counting in segment lengths)
     let part = 0, best = Infinity;
+    const anyCarriers = this.parts.some(p => p.legs);           // if the body says which segments carry legs, only use those
     this.parts.forEach((p, i) => {
+      if (anyCarriers && !p.legs) return;
       const d = Math.abs(def.hipZ - p.zc) / (p.length / 2);
       if (d < best) { best = d; part = i; }
     });
@@ -671,7 +713,13 @@ class Creature {
     this.pos.set(x, 0, z); this.goalPos.set(x, 0, z);
     this.yaw = yaw; this.goalYaw = yaw;
     this.speed = 0; this._yawRate = 0;
-    for (const l of this.legs) { l.stepping = false; l.armed = false; this._restFoot(l, x, z, yaw, 0, l.pos); }
+    for (const s of [this._sp, this._yr, this._tA, this._tB, this._bk]) { s.x = 0; s.v = 0; }
+    this._pace.x = 1; this._pace.v = 0;
+    this._px.x = x; this._pz.x = z; this._yawS.x = yaw;
+    for (const s of [this._px, this._pz, this._yawS]) s.v = 0;
+    for (const l of this.legs) { l.stepping = false; l.armed = false; l.kneeReady = false; this._restFoot(l, x, z, yaw, 0, l.pos); }
+    this.bodyY = this.world.groundHeight(x, z) + this.standHeight;
+    this._ys.x = this.bodyY; this._ys.v = 0; this._lastBodyY = this.bodyY;
     this.q.setFromAxisAngle(UP, yaw);
     this.settle();
   }
@@ -714,15 +762,15 @@ class Creature {
     // follows the feet's overall direction, not each individual footfall.
     // (Easing alone makes the body lag behind the feet by speed / rate, which pushes every foot ahead of its
     // hip. So we also pass along most of the driver's turning speed, and let the feet correct any difference.)
-    this.yaw += this._yawRate * dt * 0.8 + (targetYaw - this.yaw) * Math.min(1, dt * 4);
+    this.yaw = this._yawS.update(targetYaw, dt, 4, this._yawRate * 0.9);     // (the spring also knows how fast the driver turns, so it doesn't trail)
 
     // Where do the feet say the body is? Their middle, minus where the feet rest relative to the body.
     const s = Math.sin(this.yaw), c = Math.cos(this.yaw);
     const tx = cx - (this._restC.x * c + this._restC.z * s);
     const tz = cz - (-this._restC.x * s + this._restC.z * c);
-    const k = Math.min(1, dt * 5);
-    this.pos.x += Math.sin(this.goalYaw) * this.speed * dt + (tx - this.pos.x) * k;   // keep up with the driver's speed, feet correct the rest
-    this.pos.z += Math.cos(this.goalYaw) * this.speed * dt + (tz - this.pos.z) * k;
+    // keep up with the driver's speed, and let the feet correct the rest
+    this.pos.x = this._px.update(tx, dt, 8, Math.sin(this.goalYaw) * this.speed);
+    this.pos.z = this._pz.update(tz, dt, 8, Math.cos(this.goalYaw) * this.speed);
   }
 
   // ---- BODY SEGMENTS ---------------------------------------------------
@@ -804,19 +852,20 @@ class Creature {
     // Each foot (or where it will land, if it is in the air) in the body's own frame
     let mx = 0, mz = 0, my = 0;
     for (const l of legs) {
-      const f = l.stepping ? l.to : l.pos;
-      const dx = f.x - this.pos.x, dz = f.z - this.pos.z;
+      // A foot in the air counts as the ground below it (not its lifted height), so the lean
+      // doesn't jolt when a foot lifts off or lands.
+      l.sy = l.stepping ? this.world.groundHeight(l.pos.x, l.pos.z) : l.pos.y;
+      const dx = l.pos.x - this.pos.x, dz = l.pos.z - this.pos.z;
       l.lx = dx * c - dz * s;
       l.lz = dx * s + dz * c;
-      mx += l.lx; mz += l.lz; my += f.y;
+      mx += l.lx; mz += l.lz; my += l.sy;
     }
     const n = legs.length;
     mx /= n; mz /= n; my /= n;
 
     let sxx = 0, szz = 0, sxz = 0, sxy = 0, szy = 0;
     for (const l of legs) {
-      const f = l.stepping ? l.to : l.pos;
-      const ax = l.lx - mx, az = l.lz - mz, ay = f.y - my;
+      const ax = l.lx - mx, az = l.lz - mz, ay = l.sy - my;
       sxx += ax * ax; szz += az * az; sxz += ax * az; sxy += ax * ay; szy += az * ay;
     }
     const eps = 0.05;                                  // keeps it stable when feet line up (like two legs)
@@ -829,9 +878,8 @@ class Creature {
     const slope = Math.hypot(A, B), maxSlope = 0.65;   // don't lean past about 33 degrees
     if (slope > maxSlope) { A *= maxSlope / slope; B *= maxSlope / slope; }
 
-    const k = Math.min(1, dt * 5);                     // ease toward the new lean, don't snap
-    this.tiltA += (A - this.tiltA) * k;
-    this.tiltB += (B - this.tiltB) * k;
+    this.tiltA = this._tA.update(A, dt, 6);            // glide toward the new lean, don't snap
+    this.tiltB = this._tB.update(B, dt, 6);
 
     // Lean into turns, like a bike
     // Weight shift: when the feet on one side lift, the body leans toward the side still standing
@@ -843,7 +891,7 @@ class Creature {
     const sway = (rightN ? rightDown / rightN : 0.5) - (leftN ? leftDown / leftN : 0.5);   // +1 when only the right feet are down
     const gaitAmount = Math.min(1, Math.abs(this.speed) / this.maxSpeed * 3);
     const bankTarget = -Math.max(-1, Math.min(1, this._yawRate / 1.6)) * (this.speed / this.maxSpeed) * 0.15 + 0.06 * sway * gaitAmount;
-    this.bank += (bankTarget - this.bank) * Math.min(1, dt * 4);
+    this.bank = this._bk.update(bankTarget, dt, 6);
 
     T.n.set(-this.tiltA, 1, -this.tiltB).normalize();  // which way is "up" for the tilted body
     this._qTilt.setFromUnitVectors(UP, T.n);
@@ -1073,6 +1121,7 @@ class Creature {
         l.from.x + (l.to.x - l.from.x) * f, l.from.z + (l.to.z - l.from.z) * f));
     }
     l.arc = Math.max(l.length * g.stepHeight, top + 0.12 - (l.from.y + l.to.y) / 2);
+    l.arc = Math.min(l.arc, 0.4 * l.length);          // never lift a foot right up beside its hip (the leg folds so tightly the knee can pop)
 
     // Never move a foot faster than a believable speed: long or high steps take longer
     const pathLength = flat + 2 * l.arc + Math.abs(rise);
@@ -1100,11 +1149,11 @@ class Creature {
     const leashYaw = clamp01(1 - (yawErr - 0.35) / 0.6);                 // about 20 degrees of slack, then slow the turn
     const strainPace = this._strain > 1.15 ? Math.max(0.3, 1.15 / this._strain) : 1;   // hard ground: ease off
     const paceTarget = Math.min(strainPace, leashPos, 0.3 + 0.7 * leashYaw);
-    this.pace += (paceTarget - this.pace) * Math.min(1, dt * 8);
+    this.pace = this._pace.update(paceTarget, dt, 6);
     const wantSpeed = this.fwd * this.maxSpeed * this.pace;
     const limitedSpeed = Math.max(-this._speedLimit, Math.min(this._speedLimit, wantSpeed));
-    this.speed += (limitedSpeed - this.speed) * Math.min(1, dt * 4);
-    this._yawRate = this.turn * 1.6 * Math.max(0.12, leashYaw);
+    this.speed = this._sp.update(limitedSpeed, dt, 6);
+    this._yawRate = this._yr.update(this.turn * 1.6 * Math.max(0.12, leashYaw), dt, 10);
     this.goalYaw += this._yawRate * dt;
     this.goalPos.x += Math.sin(this.goalYaw) * this.speed * dt;
     this.goalPos.z += Math.cos(this.goalYaw) * this.speed * dt;
@@ -1155,12 +1204,14 @@ class Creature {
       if (l.stepping) {
         l.t += dt / l.stepDur;
         const k = Math.min(l.t, 1);
-        const e = smooth01(k);
+        const e = smoother(k);                         // speed and acceleration both start and end at zero
         l.pos.x = l.from.x + (l.to.x - l.from.x) * e;
         l.pos.z = l.from.z + (l.to.z - l.from.z) * e;
         // Going up: rise early so the foot clears the edge. Going down: drop late.
-        const ey = (l.to.y >= l.from.y) ? smooth01(Math.min(1, k * 1.8)) : smooth01(Math.max(0, (k - 0.45) / 0.55));
-        l.pos.y = l.from.y + (l.to.y - l.from.y) * ey + Math.sin(Math.PI * k) * l.arc;
+        const ey = (l.to.y >= l.from.y) ? smoother(Math.min(1, k * 1.8)) : smoother(Math.max(0, (k - 0.45) / 0.55));
+        // The lift is a bump that is flat at both ends (so the foot peels off and settles down gently, instead of
+        // leaving the ground at full speed the way a plain sine curve does)
+        l.pos.y = l.from.y + (l.to.y - l.from.y) * ey + 64 * k * k * k * (1 - k) * (1 - k) * (1 - k) * l.arc;
         if (l.t >= 1) { l.stepping = false; l.pos.copy(l.to); }
       } else {
         // A planted foot stays put, but follows the ground if the ground changes
@@ -1201,15 +1252,17 @@ class Creature {
       }
     }
     targetY = Math.max(targetY, softFloor, hardFloor);
-    const rate = targetY > this.bodyY ? 12 : 7;         // rise quickly, settle gently
-    this.bodyY += (targetY - this.bodyY) * Math.min(1, dt * rate);
-    this.bodyY = Math.max(this.bodyY, hardFloor);       // never sink into the ground
+    this.bodyY = this._ys.update(targetY, dt, 10);        // glide to the wanted height
+    if (this.bodyY < hardFloor) {                         // ...but never sink into the ground
+      this.bodyY = this._ys.x = hardFloor;
+      if (this._ys.v < 0) this._ys.v = 0;
+    }
 
     // 6. Place the shapes
     this.bodyGroup.position.set(this.pos.x, this.bodyY, this.pos.z);
     this.bodyGroup.quaternion.copy(this.q);
     for (const l of legs) this._solveLegIK(l, dt);
-    this._separateLegs();
+    this._separateLegs(dt);
     for (const l of legs) this._placeLeg(l, dt);
   }
 
@@ -1223,19 +1276,29 @@ class Creature {
     const footLift = l.footSize * 0.45;
     end.set(l.pos.x, l.pos.y + footLift, l.pos.z);
 
-    // If the foot is out of reach, stretch toward it as far as the leg goes
+    // A leg that is nearly straight makes its knee move extremely fast for tiny changes (a knee is
+    // found with a square root, which is steepest right where the leg is fully straight), and the
+    // knee would pop. So past 88% of its length the leg gives a little: it can get close to
+    // straight, but never quite reaches it, and the knee moves smoothly the whole way.
     v.subVectors(end, hip);
     let dist = v.length();
-    const maxDist = l.length * 0.999;
-    if (dist > maxDist) {
-      v.multiplyScalar(maxDist / dist);
-      dist = maxDist;
+    const soft = l.length * 0.88, room = l.length * 0.999 - soft;
+    if (dist > soft) {
+      const eased = soft + room * Math.tanh((dist - soft) / room);
+      v.multiplyScalar(eased / dist);
+      dist = eased;
       end.copy(hip).add(v);
     }
     dir.copy(v).divideScalar(dist);                  // direction from hip to foot
 
-    // Knees bend up and a little outward (relative to the tilted body), like a spider
-    pole.set(l.side * 0.6, 1, 0).applyQuaternion(this.q);
+    // Knees bend outward and up (relative to the tilted body), like a spider. Mostly outward: if the
+    // knee direction were mostly "up", a leg pointing straight down would flip it back and forth
+    // (the two are opposite, so which way to bulge is undecided). Outward is never opposite to a downward leg.
+    pole.set(l.side * 1.0, 0.8, 0).applyQuaternion(this.q).normalize();
+    // If the leg points almost along that direction (a foot lifted up and out), "bend perpendicular to
+    // the leg" becomes unstable. Blend toward a different direction (forward) so the knee swings smoothly past.
+    const w = smooth01(Math.max(0, Math.min(1, (Math.abs(pole.dot(dir)) - 0.65) / 0.3)));
+    if (w > 0) pole.lerp(v.set(0, 0, 1).applyQuaternion(this.q), w);
     pole.addScaledVector(dir, -pole.dot(dir)).normalize();
     l.poleS.lerp(pole, Math.min(1, dt * 20));        // ease the knee direction so it never flicks suddenly
     l.poleS.addScaledVector(dir, -l.poleS.dot(dir));
@@ -1252,8 +1315,26 @@ class Creature {
 
   // Last safety net: if two neighboring legs would pass through each other, push
   // their knees apart. (Choosing good landing spots already prevents most of this.)
-  _separateLegs() {
+  _separateLegs(dt) {
     const legs = this.legs, res = this._seg;
+    // 1. Smooth the knee that the leg's own shape asks for. A knee may only change its speed so fast,
+    //    so if the geometry ever demands a sudden jump (a foot lifted right beside its hip can do that)
+    //    the knee glides there over a few frames instead of popping.
+    for (const l of legs) {
+      if (!l.kneeReady) { l.kneePrev.copy(l.kneeP); l.kneeVel.set(0, 0, 0); l.kneeReady = true; }
+      const want = this._tmp.o.copy(l.kneeP).sub(l.kneePrev).addScaledVector(l.kneeVel, -dt);   // how far from where it was heading
+      const maxStep = KNEE_MAX_ACCEL * dt * dt;
+      if (want.length() > maxStep) want.setLength(maxStep);
+      l.kneeP.copy(l.kneePrev).addScaledVector(l.kneeVel, dt).add(want);
+      l.kneeVel.copy(l.kneeP).sub(l.kneePrev).divideScalar(dt);
+      l.kneePrev.copy(l.kneeP);
+      l.kneeBase.copy(l.kneeP);                           // where the knee is before the keep-apart pass
+    }
+    // 2. Then keep neighboring legs apart. This pass works right away (an easing delay would let legs overlap).
+    //    It starts from the push of the previous frame (which fades a little each frame unless it is still
+    //    needed). Without that, a push could switch on and off every other frame and the knee would flutter.
+    const fade = Math.exp(-dt * 6);
+    for (const l of legs) l.kneeP.copy(l.kneeBase).addScaledVector(l.kneeOff, fade);
     for (let pass = 0; pass < 2; pass++) {
       for (let i = 0; i < legs.length; i++) {
         const a = legs[i];
@@ -1279,6 +1360,8 @@ class Creature {
         }
       }
     }
+    for (const l of legs) l.kneeOff.copy(l.kneeP).sub(l.kneeBase);   // remember this frame's push for the next frame
+
   }
 
   // Put the leg's shapes where its joints are
@@ -1441,6 +1524,10 @@ function keepCreatureInWorld(c) {
   const edge = LIMIT - 1;
   c.pos.x = Math.max(-edge, Math.min(edge, c.pos.x));
   c.pos.z = Math.max(-edge, Math.min(edge, c.pos.z));
+  // Only do part of the push each frame. A full push would make the body jump sideways; this slides it out.
+  c.pos.x = startX + (c.pos.x - startX) * 0.4;
+  c.pos.z = startZ + (c.pos.z - startZ) * 0.4;
+  c._px.x = c.pos.x; c._pz.x = c.pos.z;           // keep the body's springs in step
   c.goalPos.x += c.pos.x - startX;                 // the driver gets pushed along with the body
   c.goalPos.z += c.pos.z - startZ;
 }
@@ -1548,10 +1635,8 @@ const clock = new THREE.Clock();
 const gaitEl = document.getElementById('gaitInfo');
 let lastGaitText = '';
 
-function animate() {
-  requestAnimationFrame(animate);
-  const dt = Math.min(clock.getDelta(), 0.05);     // cap dt so a lag spike can't break the physics
-
+// One small step of the simulation: you, then the creature
+function simStep(dt) {
   updatePlayer(dt);
 
   if (controlCreature) steerByKeys(creature);
@@ -1559,10 +1644,21 @@ function animate() {
   else { creature.fwd = 0; creature.turn = 0; }
   creature.update(dt);
   keepCreatureInWorld(creature);
+}
+
+function animate() {
+  requestAnimationFrame(animate);
+  const frameDt = Math.min(clock.getDelta(), 0.1);   // cap it so a lag spike can't break the physics
+
+  // Split each frame into equal steps of at most 1/120 s. Small steps keep the physics stable, and equal
+  // ones that add up to exactly the frame time keep the motion even whatever the screen's refresh rate.
+  const steps = Math.max(1, Math.ceil(frameDt / (1 / 120)));
+  for (let i = 0; i < steps; i++) simStep(frameDt / steps);
+
   const gaitText = 'Gait: ' + creature.gaitName();
   if (gaitText !== lastGaitText) { gaitEl.textContent = gaitText; lastGaitText = gaitText; }
 
-  placeCamera(dt);
+  placeCamera(frameDt);
   renderer.render(scene, camera);
 }
 
